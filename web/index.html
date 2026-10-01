@@ -64,7 +64,7 @@ ws.onmessage = async (ev) => {
       stopPlayback(); statusEl.textContent = 'lista ✓';
     } else if (d.type === 'latency') {
       latencyEl.textContent =
-        `primer audio: ${d.first_audio_ms} ms · TTS: ${d.ttfa_ms} ms (${d.note})`;
+        `primer audio: ${d.first_audio_ms} ms · TTS TTFA: ${d.tts_ttfa_ms} ms (${d.note})`;
     } else if (d.type === 'dg_status') {
       dbg(`[dg] ${d.status}` + (d.error ? `: ${d.error}` : ''));
       if (d.status === 'error') statusEl.textContent = 'error de voz en servidor';
