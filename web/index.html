@@ -62,9 +62,18 @@ ws.onmessage = async (ev) => {
       statusEl.textContent = 'Luz está hablando…';
     } else if (d.type === 'tts_end') {
       stopPlayback(); statusEl.textContent = 'lista ✓';
+    } else if (d.type === 'reply') {
+      // Luz's reply text (separate from user's transcript)
+      const r = document.createElement('div');
+      r.style.cssText = 'color:#ffd88a;font-size:22px;margin:8px;max-width:640px;text-align:center;';
+      r.textContent = '💬 ' + d.text;
+      transcriptEl.appendChild(r);
     } else if (d.type === 'latency') {
+      const llm = d.llm_provider && d.llm_provider !== 'stub'
+        ? `LLM(${d.llm_provider}) TTFT: ${d.llm_ttft_ms} ms · total: ${d.llm_total_ms} ms · `
+        : `LLM: ${d.llm_provider || 'stub'} · `;
       latencyEl.textContent =
-        `primer audio: ${d.first_audio_ms} ms · TTS TTFA: ${d.tts_ttfa_ms} ms (${d.note})`;
+        `${llm}primer audio: ${d.first_audio_ms} ms · TTS TTFA: ${d.tts_ttfa_ms} ms (${d.note})`;
     } else if (d.type === 'dg_status') {
       dbg(`[dg] ${d.status}` + (d.error ? `: ${d.error}` : ''));
       if (d.status === 'error') statusEl.textContent = 'error de voz en servidor';
