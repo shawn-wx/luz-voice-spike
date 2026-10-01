@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luz · prueba de voz</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#1a1a2e; color:#fff;
+         display:flex; flex-direction:column; align-items:center; padding:24px; }
+  #talk { width:220px; height:220px; border-radius:50%; border:none; font-size:28px;
+          background:#e94560; color:#fff; margin:24px; touch-action:none; }
+  #talk.holding { background:#0f3460; transform:scale(0.96); }
+  #talk.playing { animation:pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(233,69,96,.5)} 50%{box-shadow:0 0 0 24px rgba(233,69,96,0)} }
+  #status { font-size:22px; min-height:34px; }
+  #transcript { font-size:26px; margin:16px; max-width:640px; text-align:center; min-height:80px;}
+  #latency { font-size:18px; color:#aaa; }
+  #hint { font-size:16px; color:#888; margin-top:24px; text-align:center; max-width:520px;}
+</style>
+</head>
+<body>
+  <h1>Luz · prueba de voz</h1>
+  <div id="status">conectando…</div>
+  <button id="talk">🎙<br>mantén<br>para hablar</button>
+  <div id="transcript"></div>
+  <div id="latency"></div>
+  <div id="hint">Mantén presionado el botón, habla en español, suelta.<br>
+       Si Luz está hablando y quieres interrumpir, mantén el botón de nuevo.</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const talkBtn = document.getElementById('talk');
+const transcriptEl = document.getElementById('transcript');
+const latencyEl = document.getElementById('latency');
+
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws = new WebSocket(wsProto + '//' + location.host + '/ws');
+let audioCtx = null, micStream = null, micNode = null, playing = false;
+let playQueue = [], playTimer = null;
+
+ws.onopen = () => statusEl.textContent = 'lista ✓ mantén el botón para hablar';
+ws.onclose = () => statusEl.textContent = 'desconectado';
+ws.onerror = () => statusEl.textContent = 'error de conexión';
+
+ws.onmessage = async (ev) => {
+  if (typeof ev.data === 'string') {
+    const d = JSON.parse(ev.data);
+    if (d.type === 'transcript') {
+      transcriptEl.textContent = (d.is_final ? '✔ ' : '… ') + d.text;
+    } else if (d.type === 'tts_start') {
+      playing = true; talkBtn.classList.add('playing');
+      statusEl.textContent = 'Luz está hablando…';
+    } else if (d.type === 'tts_end') {
+      stopPlayback(); statusEl.textContent = 'lista ✓';
+    } else if (d.type === 'latency') {
+      latencyEl.textContent =
+        `primer audio: ${d.first_audio_ms} ms · TTS: ${d.ttfa_ms} ms (${d.note})`;
+    }
+    return;
+  }
+  // binary PCM16 24kHz mono
+  const buf = await ev.data.arrayBuffer();
+  playQueue.push(new Int16Array(buf));
+  if (!playTimer) pumpPlayback();
+};
+
+function ensureCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function pumpPlayback() {
+  ensureCtx();
+  playTimer = setInterval(() => {
+    if (!playQueue.length || !playing) return;
+    const s16 = playQueue.shift();
+    const f32 = new Float32Array(s16.length);
+    for (let i = 0; i < s16.length; i++) f32[i] = s16[i] / 32768;
+    const ab = audioCtx.createBuffer(1, f32.length, 24000);
+    ab.getChannelData(0).set(f32);
+    const src = audioCtx.createBufferSource();
+    src.buffer = ab; src.connect(audioCtx.destination); src.start();
+  }, 60);
+}
+
+function stopPlayback() {
+  playing = false; playQueue = [];
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  talkBtn.classList.remove('playing');
+}
+
+async function startMic() {
+  ensureCtx();
+  if (playing) {  // barge-in
+    ws.send(JSON.stringify({type: 'barge_in'}));
+    stopPlayback();
+    statusEl.textContent = 'interrumpido — habla';
+  }
+  micStream = await navigator.mediaDevices.getUserMedia({audio: {
+    echoCancellation: true, noiseSuppression: true, sampleRate: 16000}});
+  const src = audioCtx.createMediaStreamSource(micStream);
+  micNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  micNode.onaudioprocess = (e) => {
+    if (ws.readyState !== 1) return;
+    const f32 = e.inputBuffer.getChannelData(0);
+    // downsample to 16kHz Int16 mono
+    const ratio = audioCtx.sampleRate / 16000;
+    const len = Math.floor(f32.length / ratio);
+    const s16 = new Int16Array(len);
+    for (let i = 0; i < len; i++) {
+      const v = f32[Math.floor(i * ratio)];
+      s16[i] = Math.max(-32768, Math.min(32767, v * 32768));
+    }
+    ws.send(s16.buffer);
+  };
+  src.connect(micNode); micNode.connect(audioCtx.destination);
+  talkBtn.classList.add('holding');
+  statusEl.textContent = 'escuchando…';
+}
+
+function stopMic() {
+  if (micNode) { micNode.disconnect(); micNode = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  talkBtn.classList.remove('holding');
+  statusEl.textContent = 'procesando…';
+}
+
+talkBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); startMic().catch(
+  err => statusEl.textContent = 'no hay acceso al micrófono'); });
+talkBtn.addEventListener('pointerup', stopMic);
+talkBtn.addEventListener('pointerleave', () => { if (micNode) stopMic(); });
+</script>
+</body>
+</html>
