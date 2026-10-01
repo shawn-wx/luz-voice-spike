@@ -107,7 +107,12 @@ async def process_request(connection, request: Request):
 # ------------------------------------------------------- provider sessions
 
 async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
-    """Stream mic audio to Deepgram, forward transcripts, call on_final(text)."""
+    """Stream mic audio to Deepgram, forward transcripts, call on_final(text).
+
+    Keeps the Deepgram session alive with KeepAlive when idle (avoids
+    NET0001 1011 timeout) and reconnects automatically if the connection
+    drops, until stop_event is set.
+    """
     qs = urllib.parse.urlencode({
         "model": "nova-3",
         "language": "es",
@@ -119,7 +124,8 @@ async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
         "sample_rate": "16000",
     })
     url = f"{DEEPGRAM_WS_BASE}?{qs}"
-    try:
+
+    async def run_session():
         async with websockets.connect(
             url, additional_headers=deepgram_auth_headers(),
             max_size=16 * 1024 * 1024,
@@ -127,41 +133,75 @@ async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
             await on_dg_status("connected", None)
 
             async def sender():
-                while True:
-                    msg = await mic_to_dg.get()  # PCM16 bytes or "FINALIZE"
-                    if msg is None or stop_event.is_set():
+                while not stop_event.is_set():
+                    try:
+                        msg = await asyncio.wait_for(mic_to_dg.get(),
+                                                     timeout=5.0)
+                    except asyncio.TimeoutError:
+                        # idle: keepalive so Deepgram doesn't 1011 us
+                        try:
+                            await dg.send(json.dumps({"type": "KeepAlive"}))
+                        except Exception:
+                            break
+                        continue
+                    if msg is None:
                         break
                     if msg == "FINALIZE":
                         try:
                             await dg.send(json.dumps({"type": "Finalize"}))
                         except Exception:
-                            pass
+                            break
                         continue
-                    await dg.send(msg)
-                await stop_event.wait()  # keep-alive until session ends
+                    try:
+                        await dg.send(msg)
+                    except Exception:
+                        break
 
             async def receiver():
-                async for raw in dg:
-                    try:
-                        d = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if d.get("type") != "Results":
-                        continue
-                    try:
-                        alt = d["channel"]["alternatives"][0]
-                    except (KeyError, IndexError):
-                        continue
-                    text = alt.get("transcript", "")
-                    if not text:
-                        continue
-                    is_final = d.get("is_final", False)
-                    await on_final(text, is_final)
+                try:
+                    async for raw in dg:
+                        try:
+                            d = json.loads(raw)
+                        except ValueError:
+                            continue
+                        if d.get("type") != "Results":
+                            continue
+                        try:
+                            alt = d["channel"]["alternatives"][0]
+                        except (KeyError, IndexError):
+                            continue
+                        text = alt.get("transcript", "")
+                        if not text:
+                            continue
+                        is_final = d.get("is_final", False)
+                        await on_final(text, is_final)
+                except websockets.exceptions.ConnectionClosed:
+                    pass
 
-            await asyncio.gather(sender(), receiver())
-    except Exception as e:
-        print(f"[dg] error: {e}")
-        await on_dg_status("error", str(e))
+            sender_task = asyncio.create_task(sender())
+            try:
+                await receiver()
+            finally:
+                sender_task.cancel()
+                try:
+                    await sender_task
+                except asyncio.CancelledError:
+                    pass
+
+    while not stop_event.is_set():
+        try:
+            await run_session()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[dg] error: {e}")
+            await on_dg_status("error", str(e))
+        if not stop_event.is_set():
+            await on_dg_status("reconnecting", None)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
 
 async def cartesia_speak(text, audio_out, cancel_event, context_id):
