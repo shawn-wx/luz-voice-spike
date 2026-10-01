@@ -29,3 +29,5 @@ primary_region = "hkg"   # test server: closest to the builder (Shanghai).
   cpu_kind = "shared"
   cpus = 1
   memory_mb = 256
+
+# redeploy trigger: keep machine always-on during the voice test window
