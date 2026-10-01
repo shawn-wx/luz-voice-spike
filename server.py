@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """Phase 2: live mic demo server — voice conversation loop (single port).
 
-Browser mic (16kHz PCM16 mono) -> Deepgram Nova-3 streaming STT -> stub reply
--> Cartesia Sonic-3 WS TTS -> browser playback, with barge-in and latency
-instrumentation.
+Browser mic (16kHz PCM16 mono) -> Deepgram Nova-3 streaming STT
+-> LLM (pluggable: deepseek | stub) with Luz persona -> Cartesia Sonic-3 WS
+TTS -> browser playback, with barge-in and latency instrumentation.
 
 One process serves everything on $PORT (default 8080):
     GET /          -> test page (web/index.html)
     GET /healthz   -> 200 ok (platform health checks)
+    GET /debug/deepseek -> DeepSeek connectivity probe (from this machine)
     WS  /ws        -> voice session
 
 Run (production, e.g. Fly.io secrets):
     DEEPGRAM_API_KEY=<raw key> CARTESIA_API_KEY=<raw key> \\
-        CARTESIA_VOICE_ID=<luz id> PORT=8080 python3 server.py
+        CARTESIA_VOICE_ID=<luz id> DEEPSEEK_API_KEY=<key> \\
+        PORT=8080 python3 server.py
 
-Run (local dev on the builder VM, uses the credential vault via surrogates):
-    DEEPGRAM_API_KEY=vault:custom.deepgram-stt CARTESIA_API_KEY=vault:custom.cartesia \\
-        CARTESIA_VOICE_ID=<luz id> python3 server.py
-    # NOTE: the deepgram-stt connector stores the full header value
-    # "Token <key>", so the vault path sends the bare surrogate as the whole
-    # Authorization value (the only pattern the egress proxy replaces).
-
-Phase 2 note: the "LLM" is a stub (fixed warm reply). Phase 3 plugs in the
-real LLM with the persona prompt.
+LLM selection: LLM_PROVIDER=deepseek (default) | stub.
+Without DEEPSEEK_API_KEY, deepseek falls back to stub automatically.
 """
 import asyncio
 import base64
@@ -51,9 +46,6 @@ DEEPGRAM_WS_BASE = os.environ.get("DEEPGRAM_WS_BASE",
                                   "wss://api.deepgram.com/v1/listen")
 CARTESIA_WS_BASE = os.environ.get("CARTESIA_WS_BASE",
                                   "wss://api.cartesia.ai/tts/websocket")
-
-# Fixed warm reply used until Phase 3 plugs in the LLM.
-STUB_REPLY = "¡Hola! Qué gusto escucharte. Cuéntame, ¿cómo va tu día?"
 
 
 def _vault_surrogate(connector: str) -> str:
@@ -291,7 +283,12 @@ async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
 
 
 async def cartesia_speak(text, audio_out, cancel_event, context_id):
-    """Stream TTS audio chunks into audio_out queue. Returns ttfa_ms."""
+    """Stream TTS audio chunks into audio_out queue. Returns ttfa_ms.
+
+    Does NOT put an end marker; the caller manages queue termination
+    (needed for multi-sentence replies where several speak calls feed
+    the same queue sequentially).
+    """
     url, extra_headers = cartesia_ws_target()
     t_send = None
     ttfa_ms = None
@@ -335,9 +332,85 @@ async def cartesia_speak(text, audio_out, cancel_event, context_id):
                     break
     except Exception as e:
         print(f"[tts] error: {e}")
-    finally:
-        await audio_out.put(None)  # end marker
     return ttfa_ms
+
+
+# ------------------------------------------------------- LLM -> speech
+
+async def llm_speak(user_text, audio_out, cancel_event, context_id, state):
+    """Stream LLM reply sentence-by-sentence into Cartesia TTS.
+
+    Returns dict with provider name and timing measurements.
+    Falls back to the stub reply if the LLM call fails.
+    """
+    import re
+    from contextlib import aclosing
+    from llm import get_provider
+    from llm.persona import SYSTEM_PROMPT
+
+    provider = get_provider()
+    llm_start = time.perf_counter()
+    llm_ttft_ms = None
+    tts_ttfa_ms = None
+    full_reply = ""
+
+    # In-session conversation history, capped at 6 turns.
+    history = state.setdefault("history", [])
+    messages = history + [{"role": "user", "content": user_text}]
+
+    async def speak_sentence(sentence):
+        nonlocal tts_ttfa_ms
+        ttfa = await cartesia_speak(sentence, audio_out,
+                                    cancel_event, context_id)
+        if tts_ttfa_ms is None and ttfa:
+            tts_ttfa_ms = ttfa
+
+    sentence_buf = ""
+    try:
+        async with aclosing(provider.chat_stream(
+                messages, SYSTEM_PROMPT, max_tokens=120)) as stream:
+            async for delta in stream:
+                if cancel_event.is_set():
+                    break
+                if llm_ttft_ms is None:
+                    llm_ttft_ms = (time.perf_counter() - llm_start) * 1000.0
+                full_reply += delta
+                sentence_buf += delta
+                while True:
+                    m = re.search(r"[.!?]\s+", sentence_buf)
+                    if not m:
+                        break
+                    sent = sentence_buf[:m.end()].strip()
+                    sentence_buf = sentence_buf[m.end():]
+                    if sent and not cancel_event.is_set():
+                        await speak_sentence(sent)
+        if sentence_buf.strip() and not cancel_event.is_set():
+            await speak_sentence(sentence_buf.strip())
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[llm] error: {e}")
+        if not full_reply and not cancel_event.is_set():
+            from llm.stub import STUB_REPLY
+            await speak_sentence(STUB_REPLY)
+            full_reply = STUB_REPLY
+    finally:
+        await audio_out.put(None)  # end marker for pump_audio
+
+    llm_total_ms = (time.perf_counter() - llm_start) * 1000.0
+    if full_reply:
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": full_reply})
+        if len(history) > 12:
+            del history[:-12]
+
+    return {
+        "provider": provider.name,
+        "llm_ttft_ms": round(llm_ttft_ms, 1) if llm_ttft_ms else None,
+        "llm_total_ms": round(llm_total_ms, 1),
+        "tts_ttfa_ms": round(tts_ttfa_ms, 1) if tts_ttfa_ms else None,
+        "reply": full_reply,
+    }
 
 
 # ------------------------------------------------------- browser session
@@ -361,7 +434,7 @@ async def handle_browser(ws):
             context_id = uuid.uuid4().hex
             await ws.send(json.dumps({"type": "tts_start"}))
             speak_task = asyncio.create_task(
-                cartesia_speak(STUB_REPLY, audio_out, tts_cancel, context_id))
+                llm_speak(text, audio_out, tts_cancel, context_id, state))
 
             async def pump_audio():
                 first_sent_at = None
@@ -381,18 +454,27 @@ async def handle_browser(ws):
                 return first_sent_at
 
             pump_task = asyncio.create_task(pump_audio())
-            ttfa_ms = await speak_task
+            result = await speak_task
             first_sent_at = await pump_task
             # first_audio_ms: final transcript -> first audio byte to browser
             first_audio_ms = (
                 (first_sent_at - state["final_at"]) * 1000.0
                 if first_sent_at and state["final_at"] else None)
+            if result.get("reply"):
+                try:
+                    await ws.send(json.dumps(
+                        {"type": "reply", "text": result["reply"]}))
+                except Exception:
+                    pass
             await ws.send(json.dumps({
                 "type": "latency",
-                "tts_ttfa_ms": round(ttfa_ms, 1) if ttfa_ms else None,
+                "llm_provider": result.get("provider"),
+                "llm_ttft_ms": result.get("llm_ttft_ms"),
+                "llm_total_ms": result.get("llm_total_ms"),
+                "tts_ttfa_ms": result.get("tts_ttfa_ms"),
                 "first_audio_ms": round(first_audio_ms, 1)
                 if first_audio_ms else None,
-                "note": "Phase 2: excludes LLM; stub reply",
+                "note": f"Phase 3: {result.get('provider')}",
             }))
             state["speaking"] = False
 
