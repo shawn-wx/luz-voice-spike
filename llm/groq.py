@@ -12,7 +12,9 @@ from .base import LLMProvider
 
 API_URL = os.environ.get("GROQ_API_URL",
                          "https://api.groq.com/openai/v1/chat/completions")
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+# NOTE (2026-10-01): llama-3.1-8b-instant / llama-3.3-70b-versatile became
+# enterprise-only on 2026-08-16; gpt-oss-20b is the fastest self-serve model.
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
 class GroqProvider(LLMProvider):
