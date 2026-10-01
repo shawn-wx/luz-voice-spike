@@ -238,6 +238,7 @@ async def handle_browser(ws):
                 cartesia_speak(STUB_REPLY, audio_out, tts_cancel, context_id))
 
             async def pump_audio():
+                first_sent_at = None
                 while True:
                     chunk = await audio_out.get()
                     if chunk is None:
@@ -246,16 +247,20 @@ async def handle_browser(ws):
                         break
                     try:
                         await ws.send(chunk)  # binary PCM16 24kHz
+                        if first_sent_at is None:
+                            first_sent_at = time.perf_counter()
                     except Exception:
                         break
                 await ws.send(json.dumps({"type": "tts_end"}))
+                return first_sent_at
 
             pump_task = asyncio.create_task(pump_audio())
             ttfa_ms = await speak_task
-            await pump_task
+            first_sent_at = await pump_task
+            # first_audio_ms: final transcript -> first audio byte to browser
             first_audio_ms = (
-                (time.perf_counter() - state["final_at"]) * 1000.0
-                if state["final_at"] else None)
+                (first_sent_at - state["final_at"]) * 1000.0
+                if first_sent_at and state["final_at"] else None)
             await ws.send(json.dumps({
                 "type": "latency",
                 "tts_ttfa_ms": round(ttfa_ms, 1) if ttfa_ms else None,
