@@ -1,31 +1,29 @@
-# Fly.io deploy config for the Phase 2 voice demo.
-# Secrets (set in the Fly.io dashboard -> app -> Secrets):
-#   DEEPGRAM_API_KEY  = raw Deepgram API key (no prefix; server adds "Token ")
-#   CARTESIA_API_KEY  = raw Cartesia API key
-#   CARTESIA_VOICE_ID = Luz voice id (c68a8bd0-f99e-4e7f-915d-a097da6d024c)
-app = "luz-voice-spike"
-primary_region = "hkg"   # test server: closest to the builder (Shanghai).
-                         # production for MX/BR users: gru (São Paulo) + iad/dfw (US)
+# fly.toml app configuration file generated for luz-voice-spike on 2026-10-01T05:38:06Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'luz-voice-spike'
+primary_region = 'lax'
 
 [build]
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1   # keep warm during the test window (avoids cold start);
-                             # scale to 0 afterwards to save cost
+  min_machines_running = 1
 
   [[http_service.checks]]
-    grace_period = "10s"
-    interval = "30s"
-    method = "GET"
-    path = "/healthz"
-    protocol = "http"
-    timeout = "5s"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
+    protocol = 'http'
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
