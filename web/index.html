@@ -15,6 +15,8 @@
   #status { font-size:22px; min-height:34px; }
   #transcript { font-size:26px; margin:16px; max-width:640px; text-align:center; min-height:80px;}
   #latency { font-size:18px; color:#aaa; }
+  #debug { font-size:14px; color:#6cf; margin-top:12px; max-width:640px;
+           text-align:left; white-space:pre-wrap; font-family:monospace; }
   #hint { font-size:16px; color:#888; margin-top:24px; text-align:center; max-width:520px;}
 </style>
 </head>
@@ -24,6 +26,7 @@
   <button id="talk">🎙<br>mantén<br>para hablar</button>
   <div id="transcript"></div>
   <div id="latency"></div>
+  <div id="debug"></div>
   <div id="hint">Mantén presionado el botón, habla en español, suelta.<br>
        Si Luz está hablando y quieres interrumpir, mantén el botón de nuevo.</div>
 
@@ -32,6 +35,13 @@ const statusEl = document.getElementById('status');
 const talkBtn = document.getElementById('talk');
 const transcriptEl = document.getElementById('transcript');
 const latencyEl = document.getElementById('latency');
+const debugEl = document.getElementById('debug');
+function dbg(msg) {
+  debugEl.textContent += msg + '\n';
+  // keep it short
+  const lines = debugEl.textContent.split('\n');
+  if (lines.length > 12) debugEl.textContent = lines.slice(-12).join('\n');
+}
 
 const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const ws = new WebSocket(wsProto + '//' + location.host + '/ws');
@@ -55,6 +65,11 @@ ws.onmessage = async (ev) => {
     } else if (d.type === 'latency') {
       latencyEl.textContent =
         `primer audio: ${d.first_audio_ms} ms · TTS: ${d.ttfa_ms} ms (${d.note})`;
+    } else if (d.type === 'dg_status') {
+      dbg(`[dg] ${d.status}` + (d.error ? `: ${d.error}` : ''));
+      if (d.status === 'error') statusEl.textContent = 'error de voz en servidor';
+    } else if (d.type === 'debug') {
+      dbg(`[srv] ${d.msg}`);
     }
     return;
   }
@@ -119,6 +134,10 @@ async function startMic() {
 }
 
 function stopMic() {
+  // tell the server to finalize the utterance (forces Deepgram final)
+  if (ws.readyState === 1) {
+    try { ws.send(JSON.stringify({type: 'utterance_end'})); } catch (e) {}
+  }
   if (micNode) { micNode.disconnect(); micNode = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   talkBtn.classList.remove('holding');
