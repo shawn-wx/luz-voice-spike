@@ -14,14 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Move machine to hkg (destroy current, deploy recreates)
-        run: |
-          flyctl machine list -a luz-voice-spike --json | python3 -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)]" | while read id; do
-            echo "Destroying $id"
-            flyctl machine destroy "$id" --force -a luz-voice-spike || true
-          done
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
