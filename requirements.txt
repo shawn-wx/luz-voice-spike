@@ -1,2 +1,3 @@
 requests>=2.31
 websockets>=14
+httpx>=0.27
