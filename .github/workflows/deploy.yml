@@ -1,0 +1,19 @@
+name: Deploy to Fly.io
+
+# Deploys on every push to main, or manually from the Actions tab.
+# First push will fail with "FLY_API_TOKEN not set" until the secret is added
+# (repo Settings -> Secrets and variables -> Actions). Re-run after adding it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
