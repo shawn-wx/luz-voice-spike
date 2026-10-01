@@ -96,12 +96,98 @@ async def process_request(connection, request: Request):
     if request.path == "/healthz":
         return Response(200, "OK",
                         Headers([("Content-Type", "text/plain")]), b"ok")
+    if request.path == "/debug/deepseek":
+        body = json.dumps(await debug_deepseek(),
+                          ensure_ascii=False).encode("utf-8")
+        return Response(200, "OK",
+                        Headers([("Content-Type",
+                                   "application/json; charset=utf-8")]),
+                        body)
     if request.path in ("/", "/index.html"):
         return Response(200, "OK",
                         Headers([("Content-Type",
                                    "text/html; charset=utf-8")]),
                         INDEX_HTML)
     return None  # anything else -> WebSocket handshake
+
+
+async def debug_deepseek() -> dict:
+    """Connectivity probe from this machine to api.deepseek.com.
+
+    No API key needed for the network-level checks: an HTTP 401/400 proves
+    the full path works. If DEEPSEEK_API_KEY is set, also runs a minimal
+    chat request and reports TTFT.
+    """
+    import socket
+    import ssl as ssl_mod
+    out = {"host": "api.deepseek.com", "port": 443}
+    # DNS
+    try:
+        t0 = time.perf_counter()
+        ip = socket.gethostbyname("api.deepseek.com")
+        out["dns_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        out["resolved_ip"] = ip
+    except Exception as e:
+        out["dns_error"] = str(e)
+        return out
+    # TCP + TLS
+    try:
+        t0 = time.perf_counter()
+        ctx = ssl_mod.create_default_context()
+        raw = socket.create_connection(("api.deepseek.com", 443), timeout=10)
+        tls = ctx.wrap_socket(raw, server_hostname="api.deepseek.com")
+        out["tls_handshake_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 1)
+        out["tls_version"] = tls.version()
+        tls.close()
+    except Exception as e:
+        out["tls_error"] = str(e)
+        return out
+    # HTTPS (no key -> 401/400 still proves connectivity)
+    try:
+        import httpx
+        t0 = time.perf_counter()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                json={"model": "deepseek-chat",
+                      "messages": [{"role": "user", "content": "hi"}]},
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer probe-no-key"})
+        out["https_status"] = r.status_code
+        out["https_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        out["https_body_head"] = r.text[:120]
+    except Exception as e:
+        out["https_error"] = str(e)
+        return out
+    # Real inference probe (only if key configured)
+    ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if ds_key and not ds_key.startswith("vault:"):
+        try:
+            from llm import get_provider
+            from llm.persona import SYSTEM_PROMPT
+            provider = get_provider("deepseek")
+            t0 = time.perf_counter()
+            ttft_ms = None
+            chars = 0
+            async for delta in provider.chat_stream(
+                    [{"role": "user", "content": "Hola, ¿cómo estás?"}],
+                    SYSTEM_PROMPT, max_tokens=60):
+                if ttft_ms is None:
+                    ttft_ms = round(
+                        (time.perf_counter() - t0) * 1000, 1)
+                chars += len(delta)
+            total_ms = round((time.perf_counter() - t0) * 1000, 1)
+            out["llm_ok"] = True
+            out["llm_ttft_ms"] = ttft_ms
+            out["llm_total_ms"] = total_ms
+            out["llm_chars"] = chars
+        except Exception as e:
+            out["llm_ok"] = False
+            out["llm_error"] = str(e)[:200]
+    else:
+        out["llm_skipped"] = "DEEPSEEK_API_KEY not set"
+    return out
 
 
 # ------------------------------------------------------- provider sessions
