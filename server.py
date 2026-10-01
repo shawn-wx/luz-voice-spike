@@ -8,7 +8,9 @@ TTS -> browser playback, with barge-in and latency instrumentation.
 One process serves everything on $PORT (default 8080):
     GET /          -> test page (web/index.html)
     GET /healthz   -> 200 ok (platform health checks)
-    GET /debug/deepseek -> DeepSeek connectivity probe (from this machine)
+    GET /debug/llm      -> connectivity + inference probe for the
+                           currently configured LLM provider (LLM_PROVIDER)
+    GET /debug/deepseek -> DeepSeek connectivity probe (back-compat alias)
     WS  /ws        -> voice session
 
 Run (production, e.g. Fly.io secrets):
@@ -16,7 +18,7 @@ Run (production, e.g. Fly.io secrets):
         CARTESIA_VOICE_ID=<luz id> DEEPSEEK_API_KEY=<key> \\
         PORT=8080 python3 server.py
 
-LLM selection: LLM_PROVIDER=deepseek (default) | stub.
+LLM selection: LLM_PROVIDER=groq (default) | deepseek | stub.
 Without DEEPSEEK_API_KEY, deepseek falls back to stub automatically.
 """
 import asyncio
@@ -88,8 +90,14 @@ async def process_request(connection, request: Request):
     if request.path == "/healthz":
         return Response(200, "OK",
                         Headers([("Content-Type", "text/plain")]), b"ok")
+    if request.path == "/debug/llm":
+        body = json.dumps(await debug_llm(), ensure_ascii=False).encode("utf-8")
+        return Response(200, "OK",
+                        Headers([("Content-Type",
+                                   "application/json; charset=utf-8")]),
+                        body)
     if request.path == "/debug/deepseek":
-        body = json.dumps(await debug_deepseek(),
+        body = json.dumps(await debug_llm("deepseek"),
                           ensure_ascii=False).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
@@ -103,20 +111,40 @@ async def process_request(connection, request: Request):
     return None  # anything else -> WebSocket handshake
 
 
-async def debug_deepseek() -> dict:
-    """Connectivity probe from this machine to api.deepseek.com.
+async def debug_llm(name: str = None) -> dict:
+    """Connectivity + inference probe for an LLM provider.
 
     No API key needed for the network-level checks: an HTTP 401/400 proves
-    the full path works. If DEEPSEEK_API_KEY is set, also runs a minimal
-    chat request and reports TTFT.
+    the full path works. If the provider's API key is set, also runs a
+    minimal chat request and reports TTFT.
     """
     import socket
     import ssl as ssl_mod
-    out = {"host": "api.deepseek.com", "port": 443}
+
+    name = (name or os.environ.get("LLM_PROVIDER", "groq")).lower()
+    conf = {
+        "deepseek": {
+            "host": "api.deepseek.com",
+            "url": "https://api.deepseek.com/chat/completions",
+            "model": "deepseek-chat",
+            "key_env": "DEEPSEEK_API_KEY",
+        },
+        "groq": {
+            "host": "api.groq.com",
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "model": os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"),
+            "key_env": "GROQ_API_KEY",
+        },
+    }.get(name)
+    if conf is None:
+        return {"error": f"unknown provider for probe: {name}"}
+
+    host = conf["host"]
+    out = {"provider": name, "host": host, "port": 443}
     # DNS
     try:
         t0 = time.perf_counter()
-        ip = socket.gethostbyname("api.deepseek.com")
+        ip = socket.gethostbyname(host)
         out["dns_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         out["resolved_ip"] = ip
     except Exception as e:
@@ -126,8 +154,8 @@ async def debug_deepseek() -> dict:
     try:
         t0 = time.perf_counter()
         ctx = ssl_mod.create_default_context()
-        raw = socket.create_connection(("api.deepseek.com", 443), timeout=10)
-        tls = ctx.wrap_socket(raw, server_hostname="api.deepseek.com")
+        raw = socket.create_connection((host, 443), timeout=10)
+        tls = ctx.wrap_socket(raw, server_hostname=host)
         out["tls_handshake_ms"] = round(
             (time.perf_counter() - t0) * 1000, 1)
         out["tls_version"] = tls.version()
@@ -141,8 +169,8 @@ async def debug_deepseek() -> dict:
         t0 = time.perf_counter()
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                json={"model": "deepseek-chat",
+                conf["url"],
+                json={"model": conf["model"],
                       "messages": [{"role": "user", "content": "hi"}]},
                 headers={"Content-Type": "application/json",
                          "Authorization": "Bearer probe-no-key"})
@@ -153,12 +181,12 @@ async def debug_deepseek() -> dict:
         out["https_error"] = str(e)
         return out
     # Real inference probe (only if key configured)
-    ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if ds_key and not ds_key.startswith("vault:"):
+    api_key = os.environ.get(conf["key_env"], "")
+    if api_key:
         try:
             from llm import get_provider
             from llm.persona import SYSTEM_PROMPT
-            provider = get_provider("deepseek")
+            provider = get_provider(name)
             t0 = time.perf_counter()
             ttft_ms = None
             chars = 0
@@ -178,8 +206,13 @@ async def debug_deepseek() -> dict:
             out["llm_ok"] = False
             out["llm_error"] = str(e)[:200]
     else:
-        out["llm_skipped"] = "DEEPSEEK_API_KEY not set"
+        out["llm_skipped"] = f"{conf['key_env']} not set"
     return out
+
+
+# Back-compat alias
+async def debug_deepseek() -> dict:
+    return await debug_llm("deepseek")
 
 
 # ------------------------------------------------------- provider sessions
