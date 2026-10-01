@@ -12,10 +12,9 @@ primary_region = "sin"   # hkg is deprecated by Fly.io (2026); sin = Singapore, 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "off"   # test window: keep it always on (~$2/mo).
-                               # re-enable autostop after the spike to save cost.
+  auto_stop_machines = "suspend"   # spike done: suspend when idle to save cost.
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0        # scale to zero when idle; wakes on next visit.
 
   [[http_service.checks]]
     grace_period = "10s"
