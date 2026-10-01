@@ -132,7 +132,7 @@ async def debug_llm(name: str = None) -> dict:
         "groq": {
             "host": "api.groq.com",
             "url": "https://api.groq.com/openai/v1/chat/completions",
-            "model": os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"),
+            "model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
             "key_env": "GROQ_API_KEY",
         },
     }.get(name)
