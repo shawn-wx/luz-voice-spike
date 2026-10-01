@@ -106,7 +106,7 @@ async def process_request(connection, request: Request):
 
 # ------------------------------------------------------- provider sessions
 
-async def deepgram_listen(send_to_browser, on_final, stop_event):
+async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
     """Stream mic audio to Deepgram, forward transcripts, call on_final(text)."""
     qs = urllib.parse.urlencode({
         "model": "nova-3",
@@ -124,11 +124,19 @@ async def deepgram_listen(send_to_browser, on_final, stop_event):
             url, additional_headers=deepgram_auth_headers(),
             max_size=16 * 1024 * 1024,
         ) as dg:
+            await on_dg_status("connected", None)
+
             async def sender():
                 while True:
-                    msg = await send_to_browser.get()  # PCM16 bytes
+                    msg = await mic_to_dg.get()  # PCM16 bytes or "FINALIZE"
                     if msg is None or stop_event.is_set():
                         break
+                    if msg == "FINALIZE":
+                        try:
+                            await dg.send(json.dumps({"type": "Finalize"}))
+                        except Exception:
+                            pass
+                        continue
                     await dg.send(msg)
                 await stop_event.wait()  # keep-alive until session ends
 
@@ -153,6 +161,7 @@ async def deepgram_listen(send_to_browser, on_final, stop_event):
             await asyncio.gather(sender(), receiver())
     except Exception as e:
         print(f"[dg] error: {e}")
+        await on_dg_status("error", str(e))
 
 
 async def cartesia_speak(text, audio_out, cancel_event, context_id):
@@ -256,13 +265,27 @@ async def handle_browser(ws):
             }))
             state["speaking"] = False
 
+    async def on_dg_status(status, error):
+        try:
+            await ws.send(json.dumps(
+                {"type": "dg_status", "status": status, "error": error}))
+        except Exception:
+            pass
+
     dg_task = asyncio.create_task(
-        deepgram_listen(mic_queue, on_final, stop_event))
+        deepgram_listen(mic_queue, on_final, on_dg_status, stop_event))
 
     try:
         async for msg in ws:
             if isinstance(msg, bytes):
                 # mic PCM16 16kHz mono from browser
+                if not state.get("got_audio"):
+                    state["got_audio"] = True
+                    try:
+                        await ws.send(json.dumps(
+                            {"type": "debug", "msg": "audio flowing ✓"}))
+                    except Exception:
+                        pass
                 if not state["speaking"]:
                     await mic_queue.put(msg)
                 # else: drop mic audio while TTS is playing (half-duplex v1)
@@ -275,6 +298,9 @@ async def handle_browser(ws):
                     print("[session] barge-in: cancelling TTS")
                     tts_cancel.set()
                     state["speaking"] = False
+                elif d.get("type") == "utterance_end":
+                    # user released the button: force Deepgram to finalize
+                    await mic_queue.put("FINALIZE")
                 elif d.get("type") == "stop":
                     break
     except websockets.exceptions.ConnectionClosed:
