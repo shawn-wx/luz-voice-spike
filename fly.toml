@@ -4,7 +4,7 @@
 #   CARTESIA_API_KEY  = raw Cartesia API key
 #   CARTESIA_VOICE_ID = Luz voice id (c68a8bd0-f99e-4e7f-915d-a097da6d024c)
 app = "luz-voice-spike"
-primary_region = "hkg"   # test server: closest to the builder (Shanghai).
+primary_region = "sin"   # hkg is deprecated by Fly.io (2026); sin = Singapore, closest healthy region   # test server: closest to the builder (Shanghai).
                          # production for MX/BR users: gru (São Paulo) + iad/dfw (US)
 
 [build]
