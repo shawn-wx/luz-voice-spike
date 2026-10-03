@@ -122,7 +122,9 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
             # 2. configure session (manual mode), wait for session.updated
             await ws.send(_event("session.update", session={
                 "modalities": ["text"],
-                "input_audio_format": "pcm16",
+                # NOTE: server rejects "pcm16" here ("Audio format is not
+                # valid 'pcm16'!"); the accepted value is "pcm".
+                "input_audio_format": "pcm",
                 "input_audio_transcription": {"sample_rate": 16000,
                                               "language": ASR_LANG},
                 "turn_detection": None,
