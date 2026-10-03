@@ -28,6 +28,13 @@ def get_provider(name: str = None) -> "LLMProvider":
             return p
         print("[llm] DEEPSEEK_API_KEY not set, falling back to stub")
         name = "stub"
+    if name == "dashscope":
+        from .dashscope import DashScopeProvider
+        p = DashScopeProvider()
+        if p.has_key():
+            return p
+        print("[llm] DASHSCOPE_API_KEY not set, falling back to stub")
+        name = "stub"
     if name == "stub":
         from .stub import StubProvider
         return StubProvider()
