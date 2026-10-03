@@ -285,8 +285,8 @@ async def dashscope_speak(text, audio_out, cancel_event, context_id,
                 return None, []
             await ws.send(_event("session.update", session={
                 "voice": TTS_VOICE,
-                "response_format": "pcm16",
-                "sample_rate": 24000,
+                "response_format": "pcm",  # pcm16 rejected; server allows
+                "sample_rate": 24000,      # [mp3, wav, pcm, opus]
                 "mode": "server_commit",
             }))
             # wait for session.updated (surface rejection immediately)
