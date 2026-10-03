@@ -291,7 +291,11 @@ async def debug_llm(name: str = None, model: str = None) -> dict:
         conf["model"] = model
 
     host = conf["host"]
-    out = {"provider": name, "host": host, "port": 443}
+    out = {"provider": name, "host": host, "port": 443,
+           "model": conf["model"],
+           "model_source": ("env DASHSCOPE_MODEL"
+                            if "DASHSCOPE_MODEL" in os.environ
+                            else "code default")}
     # DNS
     try:
         t0 = time.perf_counter()
