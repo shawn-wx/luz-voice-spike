@@ -2,6 +2,8 @@
 
 International endpoint (Singapore):
     wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime?model=<model>
+Beijing endpoint:
+    wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=<model>
 Auth headers:  Authorization: Bearer <DASHSCOPE_API_KEY>
                OpenAI-Beta: realtime=v1
 
@@ -9,23 +11,20 @@ Models:
     ASR: qwen3-asr-flash-realtime  (mic PCM16 16kHz in, transcripts out)
     TTS: qwen3-tts-flash-realtime  (text in, PCM16 24kHz audio out)
 
-Protocol follows OpenAI realtime conventions (per DashScope docs):
-    client -> server: session.update, input_audio_buffer.append,
-                      input_audio_buffer.commit, conversation.item.create,
-                      response.create, response.cancel
-    server -> client: session.created,
-                      conversation.item.input_audio_transcription.delta /
-                          .completed  (ASR; parsed defensively),
-                      response.audio.delta / response.audio.done /
-                          response.done  (TTS), error
+ASR session.update schema (per DashScope docs + waav provider doc):
+    {"type": "session.update", "session": {
+        "modalities": ["text"],
+        "input_audio_format": "pcm16",
+        "input_audio_transcription": {"sample_rate": 16000,
+                                      "language": "zh"},
+        "turn_detection": None}}          # null = manual mode; we commit
+                                          # explicitly on FINALIZE
+Server transcription events:
+    conversation.item.input_audio_transcription.text      (partial)
+    conversation.item.input_audio_transcription.completed (final)
 
 DASHSCOPE_WS_BASE env overrides the endpoint for local mock tests
 (same pattern as DEEPGRAM_WS_BASE / CARTESIA_WS_BASE).
-
-NOTE: exact DashScope event/field names were taken from the realtime-style
-docs; the first live run with a real key should confirm them via the
-/debug/dashscope probe + a short voice round-trip. Parsing below accepts
-common field-name variants so minor doc drift won't break the session.
 """
 import asyncio
 import base64
@@ -42,6 +41,7 @@ DASHSCOPE_WS_BASE = os.environ.get(
     "DASHSCOPE_WS_BASE",
     "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime")
 ASR_MODEL = os.environ.get("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash-realtime")
+ASR_LANG = os.environ.get("DASHSCOPE_ASR_LANG", "zh")
 TTS_MODEL = os.environ.get("DASHSCOPE_TTS_MODEL", "qwen3-tts-flash-realtime")
 TTS_VOICE = os.environ.get("DASHSCOPE_VOICE", "Cherry")  # verify in console
 
@@ -61,35 +61,49 @@ def _event(type_: str, **fields) -> str:
 def _extract_transcript(d: dict):
     """Return (text, is_final or None) from a transcription-ish event."""
     t = d.get("type", "")
-    if t.endswith("input_audio_transcription.delta"):
-        return d.get("delta", ""), False
+    # DashScope official: .text = partial, .completed = final
+    if t.endswith("input_audio_transcription.text"):
+        return d.get("text", ""), False
     if t.endswith("input_audio_transcription.completed"):
         return d.get("transcript", ""), True
-    # defensive variants
+    # defensive variants seen in the wild
+    if t.endswith("input_audio_transcription.delta"):
+        return d.get("delta", ""), False
     if "transcript" in d and isinstance(d["transcript"], str):
-        return d["transcript"], t.endswith(".done") or t.endswith(".completed")
+        return d["transcript"], t.endswith((".done", ".completed"))
     return None, None
 
 
+def _close_info(e: Exception) -> str:
+    code = getattr(e, "code", "?")
+    reason = getattr(e, "reason", "") or ""
+    return f"code={code} reason={reason!r}"[:160]
+
+
 async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
-    """Stream mic audio to DashScope realtime ASR.
+    """Stream mic audio to DashScope realtime ASR (manual-commit mode).
 
     Same contract as deepgram_listen(): forwards (text, is_final) to
-    on_final, keeps the session alive with reconnects until stop_event.
-    Browser sends raw PCM16 16kHz mono.
+    on_final, reconnects until stop_event. Browser sends PCM16 16kHz mono.
+    Server error events and WS close reasons are forwarded via
+    on_ds_status("error", ...) so the test page shows the real cause.
     """
     url = (f"{DASHSCOPE_WS_BASE}?"
            f"{urllib.parse.urlencode({'model': ASR_MODEL})}")
 
     async def run_session():
-        async with websockets.connect(
-            url, additional_headers=_headers(),
-            max_size=16 * 1024 * 1024,
-        ) as ds:
+        try:
+            ws = await websockets.connect(
+                url, additional_headers=_headers(),
+                max_size=16 * 1024 * 1024)
+        except Exception as e:
+            await on_ds_status("error", f"connect failed: {e}"[:200])
+            return
+        async with ws:
             await on_ds_status("connected", None)
-            # wait for session.created, then configure audio input
+            # 1. wait for session.created
             try:
-                async for raw in ds:
+                async for raw in ws:
                     try:
                         d = json.loads(raw)
                     except ValueError:
@@ -97,14 +111,39 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
                     if d.get("type") == "session.created":
                         break
                     if d.get("type") == "error":
-                        await on_ds_status("error", str(d)[:200])
+                        await on_ds_status("error",
+                                           f"handshake: {d}"[:200])
                         return
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
+                await on_ds_status("error",
+                                   f"closed before session.created: "
+                                   f"{_close_info(e)}")
                 return
-            await ds.send(_event("session.update", session={
+            # 2. configure session (manual mode), wait for session.updated
+            await ws.send(_event("session.update", session={
+                "modalities": ["text"],
                 "input_audio_format": "pcm16",
-                "input_audio_sample_rate": 16000,
+                "input_audio_transcription": {"sample_rate": 16000,
+                                              "language": ASR_LANG},
+                "turn_detection": None,
             }))
+            try:
+                async for raw in ws:
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if d.get("type") == "session.updated":
+                        break
+                    if d.get("type") == "error":
+                        await on_ds_status(
+                            "error", f"session.update rejected: {d}"[:300])
+                        return
+            except websockets.exceptions.ConnectionClosed as e:
+                await on_ds_status("error",
+                                   f"closed after session.update: "
+                                   f"{_close_info(e)}")
+                return
 
             async def sender():
                 try:
@@ -113,45 +152,47 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
                             msg = await asyncio.wait_for(mic_to_ds.get(),
                                                          timeout=15.0)
                         except asyncio.TimeoutError:
-                            continue  # realtime sessions don't need keepalive
+                            continue
                         if msg is None:
                             break
                         if msg == "FINALIZE":
                             try:
-                                await ds.send(_event(
+                                await ws.send(_event(
                                     "input_audio_buffer.commit"))
                             except Exception:
                                 break
                             continue
                         try:
-                            await ds.send(_event(
+                            await ws.send(_event(
                                 "input_audio_buffer.append",
-                                audio=base64.b64encode(msg).decode("ascii")))
+                                audio=base64.b64encode(
+                                    msg).decode("ascii")))
                         except Exception:
                             break
                 finally:
-                    # sender done -> close so receiver also exits
                     try:
-                        await ds.close()
+                        await ws.close()
                     except Exception:
                         pass
 
             async def receiver():
                 try:
-                    async for raw in ds:
+                    async for raw in ws:
                         try:
                             d = json.loads(raw)
                         except ValueError:
                             continue
                         if d.get("type") == "error":
-                            print(f"[ds-asr] error: {d}")
+                            await on_ds_status(
+                                "error", f"asr: {d}"[:300])
                             continue
                         text, is_final = _extract_transcript(d)
                         if text:
                             await on_final(text,
                                            True if is_final else False)
-                except websockets.exceptions.ConnectionClosed:
-                    pass
+                except websockets.exceptions.ConnectionClosed as e:
+                    await on_ds_status(
+                        "error", f"asr closed: {_close_info(e)}")
 
             sender_task = asyncio.create_task(sender())
             try:
@@ -170,7 +211,7 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
             raise
         except Exception as e:
             print(f"[ds-asr] error: {e}")
-            await on_ds_status("error", str(e))
+            await on_ds_status("error", str(e)[:200])
         if not stop_event.is_set():
             await on_ds_status("reconnecting", None)
             try:
