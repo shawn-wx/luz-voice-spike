@@ -591,7 +591,7 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
     audio_offset_ms = 0.0
     try:
         async with aclosing(provider.chat_stream(
-                messages, system_prompt, max_tokens=120)) as stream:
+                messages, system_prompt, max_tokens=80)) as stream:
             async for delta in stream:
                 if cancel_event.is_set():
                     break
@@ -600,9 +600,11 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                 full_reply += delta
                 sentence_buf += delta
                 while True:
-                    m = re.search(r"[.!?]\s+", sentence_buf)
+                    # 中英文句末标点都切（中文后常无空格，故 \s*）
+                    m = re.search(r"[.!?。！？]\s*", sentence_buf)
                     if not m:
                         break
+                    # 避免把 "3.14" 这类小数点误切：标点前后需有中文/字母
                     sent = sentence_buf[:m.end()].strip()
                     sentence_buf = sentence_buf[m.end():]
                     if sent and not cancel_event.is_set():
