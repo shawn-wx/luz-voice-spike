@@ -183,7 +183,15 @@ async def process_request(connection, request: Request):
                                    "application/json; charset=utf-8")]),
                         body)
     if req_path == "/debug/dashscope":
-        body = json.dumps(await debug_llm("dashscope"),
+        # ?model=qwen-turbo 覆盖默认模型（多模型测速）
+        qs2 = {}
+        try:
+            target2 = getattr(request, "target", request.path)
+            qs2 = urllib.parse.parse_qs(urllib.parse.urlparse(target2).query)
+        except Exception:
+            pass
+        model_ov = (qs2.get("model", [None])[0] or "").strip() or None
+        body = json.dumps(await debug_llm("dashscope", model=model_ov),
                           ensure_ascii=False).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
@@ -239,12 +247,14 @@ async def process_request(connection, request: Request):
     return None  # anything else -> WebSocket handshake
 
 
-async def debug_llm(name: str = None) -> dict:
+async def debug_llm(name: str = None, model: str = None) -> dict:
     """Connectivity + inference probe for an LLM provider.
 
     No API key needed for the network-level checks: an HTTP 401/400 proves
     the full path works. If the provider's API key is set, also runs a
     minimal chat request and reports TTFT.
+
+    model: optional override (for dashscope speed comparison).
     """
     import socket
     import ssl as ssl_mod
@@ -275,6 +285,10 @@ async def debug_llm(name: str = None) -> dict:
     }.get(name)
     if conf is None:
         return {"error": f"unknown provider for probe: {name}"}
+    # 允许 ?model= 覆盖（多模型测速用）
+    if model and name == "dashscope":
+        conf = dict(conf)
+        conf["model"] = model
 
     host = conf["host"]
     out = {"provider": name, "host": host, "port": 443}
@@ -323,7 +337,11 @@ async def debug_llm(name: str = None) -> dict:
         try:
             from llm import get_provider
             from llm.persona import SYSTEM_PROMPT, SYSTEM_PROMPT_ZH
-            provider = get_provider(name)
+            if model and name == "dashscope":
+                from llm.dashscope import DashScopeProvider
+                provider = DashScopeProvider(model=model)
+            else:
+                provider = get_provider(name)
             t0 = time.perf_counter()
             ttft_ms = None
             chars = 0
