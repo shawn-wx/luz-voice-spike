@@ -11,10 +11,12 @@ Models:
     ASR: qwen3-asr-flash-realtime  (mic PCM16 16kHz in, transcripts out)
     TTS: qwen3-tts-flash-realtime  (text in, PCM16 24kHz audio out)
 
-ASR session.update schema (per DashScope docs + waav provider doc):
+ASR session.update schema (verified against the live server):
     {"type": "session.update", "session": {
         "modalities": ["text"],
-        "input_audio_format": "pcm16",
+        "input_audio_format": "pcm",   # NOT "pcm16": the server rejects
+                                       # it with "Audio format is not valid
+                                       # 'pcm16'!"
         "input_audio_transcription": {"sample_rate": 16000,
                                       "language": "zh"},
         "turn_detection": None}}          # null = manual mode; we commit
