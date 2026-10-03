@@ -68,6 +68,37 @@ def get_profile() -> str:
     return "zh" if p in ("zh", "zh-cn", "dashscope", "cn") else "es"
 
 
+def conn_profile(ws) -> str:
+    """Per-connection pipeline profile.
+
+    `?profile=zh|es` on the /ws URL overrides the server default
+    (PIPELINE_PROFILE env). Unknown/missing values fall back to default.
+    This is what lets the app switch voice pipelines without rebuilds:
+    the backend config (/api/voice-config) decides the default.
+    """
+    try:
+        qs = getattr(getattr(ws, "request", None), "query_string", "") or ""
+        q = urllib.parse.parse_qs(qs).get("profile", [""])[0].lower()
+        if q in ("zh", "zh-cn", "dashscope", "cn"):
+            return "zh"
+        if q in ("es", "es-mx", "spanish"):
+            return "es"
+    except Exception:
+        pass
+    return get_profile()
+
+
+def missing_keys_for(profile: str) -> list:
+    """Env keys required for a profile; empty means ready."""
+    if profile == "zh":
+        required = [("DASHSCOPE_API_KEY", DS_KEY)]
+    else:
+        required = [("DEEPGRAM_API_KEY", DG_KEY),
+                    ("CARTESIA_API_KEY", CART_KEY),
+                    ("CARTESIA_VOICE_ID", VOICE_ID)]
+    return [k for k, v in required if not v]
+
+
 def profile_llm_provider() -> str:
     """LLM provider for the active profile (explicit LLM_PROVIDER wins)."""
     explicit = os.environ.get("LLM_PROVIDER", "")
@@ -132,6 +163,18 @@ async def process_request(connection, request: Request):
     if request.path == "/debug/dashscope":
         body = json.dumps(await debug_llm("dashscope"),
                           ensure_ascii=False).encode("utf-8")
+        return Response(200, "OK",
+                        Headers([("Content-Type",
+                                   "application/json; charset=utf-8")]),
+                        body)
+    if request.path == "/api/voice-config":
+        # 后台可配置的语音链路：app 启动时拉取，按 profile 建连 /ws?profile=。
+        # 改 PIPELINE_PROFILE secret 并重启即切换，无需重新打包 app。
+        body = json.dumps({
+            "profile": get_profile(),
+            "available": ["es", "zh"],
+            "ws_path": "/ws",
+        }).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
@@ -540,8 +583,21 @@ async def handle_browser(ws):
     tts_cancel = asyncio.Event()
     state = {"speaking": False, "final_at": None}
 
-    # Pipeline profile: es (Deepgram/Cartesia) or zh (DashScope).
-    if get_profile() == "zh":
+    # Pipeline profile: ?profile=zh|es overrides the server default.
+    profile = conn_profile(ws)
+    missing = missing_keys_for(profile)
+    if missing:
+        err = (f"voice profile '{profile}' not configured on server "
+               f"(missing: {', '.join(missing)})")
+        print(f"[session] {err}")
+        try:
+            await ws.send(json.dumps({"type": "error", "error": err}))
+            await ws.close(1011, err[:120])
+        except Exception:
+            pass
+        return
+
+    if profile == "zh":
         from dashscope_rt import dashscope_listen as asr_listen
         from dashscope_rt import dashscope_speak as _tts_speak
         from llm.persona import SYSTEM_PROMPT_ZH as persona
@@ -670,16 +726,17 @@ async def handle_browser(ws):
 
 async def main():
     profile = get_profile()
-    if profile == "zh":
-        required = [("DASHSCOPE_API_KEY", DS_KEY)]
-    else:
-        required = [("DEEPGRAM_API_KEY", DG_KEY),
-                    ("CARTESIA_API_KEY", CART_KEY),
-                    ("CARTESIA_VOICE_ID", VOICE_ID)]
-    missing = [k for k, v in required if not v]
+    missing = missing_keys_for(profile)
     if missing:
         print(f"missing env for profile={profile}: {', '.join(missing)}")
         raise SystemExit(1)
+    # 另一个 profile 没配 key 只是告警：该 profile 的连接会被明确拒绝，
+    # 不影响默认 profile 服务。
+    other = "es" if profile == "zh" else "zh"
+    other_missing = missing_keys_for(other)
+    if other_missing:
+        print(f"[warn] profile={other} unavailable "
+              f"(missing: {', '.join(other_missing)})")
     print(f"serving on http://0.0.0.0:{PORT}/  (ws: /ws)  profile={profile}")
     async with serve(handle_browser, "0.0.0.0", PORT,
                      process_request=process_request,
