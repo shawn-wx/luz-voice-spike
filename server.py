@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Phase 2: live mic demo server — voice conversation loop (single port).
 
-Browser mic (16kHz PCM16 mono) -> Deepgram Nova-3 streaming STT
--> LLM (pluggable: deepseek | stub) with Luz persona -> Cartesia Sonic-3 WS
-TTS -> browser playback, with barge-in and latency instrumentation.
+Pipeline profiles (PIPELINE_PROFILE):
+    es (default): mic -> Deepgram Nova-3 streaming STT
+                  -> LLM (groq | deepseek | stub) with Luz persona (Spanish)
+                  -> Cartesia Sonic-3 WS TTS
+    zh:           mic -> DashScope qwen3-asr-flash-realtime (Singapore)
+                  -> LLM (dashscope qwen3.8-flash) with Luz persona (Chinese)
+                  -> DashScope qwen3-tts-flash-realtime
+    -> browser playback, with barge-in and latency instrumentation.
 
 One process serves everything on $PORT (default 8080):
     GET /          -> test page (web/index.html)
@@ -11,15 +16,21 @@ One process serves everything on $PORT (default 8080):
     GET /debug/llm      -> connectivity + inference probe for the
                            currently configured LLM provider (LLM_PROVIDER)
     GET /debug/deepseek -> DeepSeek connectivity probe (back-compat alias)
+    GET /debug/dashscope -> DashScope (intl/Singapore) connectivity probe
     WS  /ws        -> voice session
 
-Run (production, e.g. Fly.io secrets):
+Run (production, e.g. Fly.io secrets) — es profile:
     DEEPGRAM_API_KEY=<raw key> CARTESIA_API_KEY=<raw key> \\
-        CARTESIA_VOICE_ID=<luz id> DEEPSEEK_API_KEY=<key> \\
+        CARTESIA_VOICE_ID=<luz id> GROQ_API_KEY=<key> \\
         PORT=8080 python3 server.py
 
-LLM selection: LLM_PROVIDER=groq (default) | deepseek | stub.
-Without DEEPSEEK_API_KEY, deepseek falls back to stub automatically.
+Run — zh profile (China demo):
+    PIPELINE_PROFILE=zh DASHSCOPE_API_KEY=<intl key> \\
+        PORT=8080 python3 server.py
+
+LLM selection: LLM_PROVIDER=groq (default) | deepseek | dashscope | stub.
+In the zh profile the LLM is forced to dashscope unless LLM_PROVIDER is set.
+Without the provider's API key, falls back to stub automatically.
 """
 import asyncio
 import base64
@@ -40,6 +51,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DG_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 CART_KEY = os.environ.get("CARTESIA_API_KEY", "")
 VOICE_ID = os.environ.get("CARTESIA_VOICE_ID", "")
+DS_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 CARTESIA_VERSION = "2026-03-01"
 # Overridable for local tests with mock providers (this dev VM has no
@@ -48,6 +60,20 @@ DEEPGRAM_WS_BASE = os.environ.get("DEEPGRAM_WS_BASE",
                                   "wss://api.deepgram.com/v1/listen")
 CARTESIA_WS_BASE = os.environ.get("CARTESIA_WS_BASE",
                                   "wss://api.cartesia.ai/tts/websocket")
+
+
+def get_profile() -> str:
+    """'zh' for the DashScope China-demo pipeline, 'es' otherwise."""
+    p = os.environ.get("PIPELINE_PROFILE", "es").lower()
+    return "zh" if p in ("zh", "zh-cn", "dashscope", "cn") else "es"
+
+
+def profile_llm_provider() -> str:
+    """LLM provider for the active profile (explicit LLM_PROVIDER wins)."""
+    explicit = os.environ.get("LLM_PROVIDER", "")
+    if explicit:
+        return explicit
+    return "dashscope" if get_profile() == "zh" else "groq"
 
 
 def _vault_surrogate(connector: str) -> str:
@@ -103,6 +129,13 @@ async def process_request(connection, request: Request):
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
                         body)
+    if request.path == "/debug/dashscope":
+        body = json.dumps(await debug_llm("dashscope"),
+                          ensure_ascii=False).encode("utf-8")
+        return Response(200, "OK",
+                        Headers([("Content-Type",
+                                   "application/json; charset=utf-8")]),
+                        body)
     if request.path in ("/", "/index.html"):
         return Response(200, "OK",
                         Headers([("Content-Type",
@@ -134,6 +167,15 @@ async def debug_llm(name: str = None) -> dict:
             "url": "https://api.groq.com/openai/v1/chat/completions",
             "model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
             "key_env": "GROQ_API_KEY",
+            "probe": "Hola, ¿cómo estás?",
+        },
+        "dashscope": {
+            "host": "dashscope-intl.aliyuncs.com",
+            "url": ("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+                    "/chat/completions"),
+            "model": os.environ.get("DASHSCOPE_MODEL", "qwen3.8-flash"),
+            "key_env": "DASHSCOPE_API_KEY",
+            "probe": "你好，你好吗？",
         },
     }.get(name)
     if conf is None:
@@ -185,14 +227,17 @@ async def debug_llm(name: str = None) -> dict:
     if api_key:
         try:
             from llm import get_provider
-            from llm.persona import SYSTEM_PROMPT
+            from llm.persona import SYSTEM_PROMPT, SYSTEM_PROMPT_ZH
             provider = get_provider(name)
             t0 = time.perf_counter()
             ttft_ms = None
             chars = 0
+            persona = (SYSTEM_PROMPT_ZH if name == "dashscope"
+                       else SYSTEM_PROMPT)
             async for delta in provider.chat_stream(
-                    [{"role": "user", "content": "Hola, ¿cómo estás?"}],
-                    SYSTEM_PROMPT, max_tokens=60):
+                    [{"role": "user",
+                      "content": conf.get("probe", "Hola, ¿cómo estás?")}],
+                    persona, max_tokens=60):
                 if ttft_ms is None:
                     ttft_ms = round(
                         (time.perf_counter() - t0) * 1000, 1)
@@ -316,7 +361,10 @@ async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
 
 
 async def cartesia_speak(text, audio_out, cancel_event, context_id):
-    """Stream TTS audio chunks into audio_out queue. Returns ttfa_ms.
+    """Stream TTS audio chunks into audio_out queue.
+
+    Returns (ttfa_ms, word_timestamps) where word_timestamps is a list of
+    {"word": str, "start_ms": float, "end_ms": float}.
 
     Does NOT put an end marker; the caller manages queue termination
     (needed for multi-sentence replies where several speak calls feed
@@ -325,6 +373,7 @@ async def cartesia_speak(text, audio_out, cancel_event, context_id):
     url, extra_headers = cartesia_ws_target()
     t_send = None
     ttfa_ms = None
+    word_timestamps = []
     try:
         async with websockets.connect(
             url, additional_headers=extra_headers or None,
@@ -340,6 +389,7 @@ async def cartesia_speak(text, audio_out, cancel_event, context_id):
                                   "sample_rate": 24000},
                 "language": "es",
                 "generation_config": {"speed": 0.9},
+                "add_timestamps": True,
             }))
             async for raw in ws:
                 if cancel_event.is_set():
@@ -358,6 +408,18 @@ async def cartesia_speak(text, audio_out, cancel_event, context_id):
                     if ttfa_ms is None:
                         ttfa_ms = (time.perf_counter() - t_send) * 1000.0
                     await audio_out.put(base64.b64decode(d["data"]))
+                elif mtype == "timestamps":
+                    # {"word_timestamps": {"words": [...], "start": [...], "end": [...]}}
+                    wt = d.get("word_timestamps", {})
+                    words = wt.get("words", [])
+                    starts = wt.get("start", [])
+                    ends = wt.get("end", [])
+                    for w, s, e in zip(words, starts, ends):
+                        word_timestamps.append({
+                            "word": w,
+                            "start_ms": round(s * 1000, 1),
+                            "end_ms": round(e * 1000, 1),
+                        })
                 elif mtype == "done":
                     break
                 elif mtype == "error":
@@ -365,13 +427,19 @@ async def cartesia_speak(text, audio_out, cancel_event, context_id):
                     break
     except Exception as e:
         print(f"[tts] error: {e}")
-    return ttfa_ms
+    return ttfa_ms, word_timestamps
 
 
 # ------------------------------------------------------- LLM -> speech
 
-async def llm_speak(user_text, audio_out, cancel_event, context_id, state):
-    """Stream LLM reply sentence-by-sentence into Cartesia TTS.
+async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
+                  tts_fn=None, system_prompt=None, llm_provider=None):
+    """Stream LLM reply sentence-by-sentence into TTS.
+
+    tts_fn: async (text, audio_out, cancel_event, context_id)
+            -> (ttfa_ms, word_timestamps). Defaults to cartesia_speak.
+    system_prompt / llm_provider: default to the es-profile Spanish
+            persona and the profile's LLM provider.
 
     Returns dict with provider name and timing measurements.
     Falls back to the stub reply if the LLM call fails.
@@ -381,7 +449,9 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state):
     from llm import get_provider
     from llm.persona import SYSTEM_PROMPT
 
-    provider = get_provider()
+    tts_fn = tts_fn or cartesia_speak
+    system_prompt = system_prompt or SYSTEM_PROMPT
+    provider = get_provider(llm_provider or profile_llm_provider())
     llm_start = time.perf_counter()
     llm_ttft_ms = None
     tts_ttfa_ms = None
@@ -393,15 +463,18 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state):
 
     async def speak_sentence(sentence):
         nonlocal tts_ttfa_ms
-        ttfa = await cartesia_speak(sentence, audio_out,
-                                    cancel_event, context_id)
+        ttfa, words = await tts_fn(sentence, audio_out,
+                                   cancel_event, context_id)
         if tts_ttfa_ms is None and ttfa:
             tts_ttfa_ms = ttfa
+        return words
 
     sentence_buf = ""
+    all_words = []  # [{"word","start_ms","end_ms"}] 相对整段回复音频
+    audio_offset_ms = 0.0
     try:
         async with aclosing(provider.chat_stream(
-                messages, SYSTEM_PROMPT, max_tokens=120)) as stream:
+                messages, system_prompt, max_tokens=120)) as stream:
             async for delta in stream:
                 if cancel_event.is_set():
                     break
@@ -416,9 +489,19 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state):
                     sent = sentence_buf[:m.end()].strip()
                     sentence_buf = sentence_buf[m.end():]
                     if sent and not cancel_event.is_set():
-                        await speak_sentence(sent)
+                        words = await speak_sentence(sent)
+                        for w in words:
+                            w["start_ms"] += audio_offset_ms
+                            w["end_ms"] += audio_offset_ms
+                        all_words.extend(words)
+                        if words:
+                            audio_offset_ms = max(w["end_ms"] for w in words)
         if sentence_buf.strip() and not cancel_event.is_set():
-            await speak_sentence(sentence_buf.strip())
+            words = await speak_sentence(sentence_buf.strip())
+            for w in words:
+                w["start_ms"] += audio_offset_ms
+                w["end_ms"] += audio_offset_ms
+            all_words.extend(words)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -443,6 +526,7 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state):
         "llm_total_ms": round(llm_total_ms, 1),
         "tts_ttfa_ms": round(tts_ttfa_ms, 1) if tts_ttfa_ms else None,
         "reply": full_reply,
+        "words": all_words,
     }
 
 
@@ -456,6 +540,18 @@ async def handle_browser(ws):
     tts_cancel = asyncio.Event()
     state = {"speaking": False, "final_at": None}
 
+    # Pipeline profile: es (Deepgram/Cartesia) or zh (DashScope).
+    if get_profile() == "zh":
+        from dashscope_rt import dashscope_listen as asr_listen
+        from dashscope_rt import dashscope_speak as tts_speak
+        from llm.persona import SYSTEM_PROMPT_ZH as persona
+        print("[session] profile=zh (DashScope)")
+    else:
+        asr_listen = deepgram_listen
+        tts_speak = cartesia_speak
+        from llm.persona import SYSTEM_PROMPT as persona
+        print("[session] profile=es (Deepgram/Cartesia)")
+
     async def on_final(text, is_final):
         await ws.send(json.dumps(
             {"type": "transcript", "text": text, "is_final": is_final}))
@@ -467,7 +563,8 @@ async def handle_browser(ws):
             context_id = uuid.uuid4().hex
             await ws.send(json.dumps({"type": "tts_start"}))
             speak_task = asyncio.create_task(
-                llm_speak(text, audio_out, tts_cancel, context_id, state))
+                llm_speak(text, audio_out, tts_cancel, context_id, state,
+                          tts_fn=tts_speak, system_prompt=persona))
 
             async def pump_audio():
                 first_sent_at = None
@@ -499,6 +596,13 @@ async def handle_browser(ws):
                         {"type": "reply", "text": result["reply"]}))
                 except Exception:
                     pass
+            # 词级时间戳（口型同步用）：tts_start 后下发
+            if result.get("words"):
+                try:
+                    await ws.send(json.dumps(
+                        {"type": "words", "words": result["words"]}))
+                except Exception:
+                    pass
             await ws.send(json.dumps({
                 "type": "latency",
                 "llm_provider": result.get("provider"),
@@ -519,7 +623,7 @@ async def handle_browser(ws):
             pass
 
     dg_task = asyncio.create_task(
-        deepgram_listen(mic_queue, on_final, on_dg_status, stop_event))
+        asr_listen(mic_queue, on_final, on_dg_status, stop_event))
 
     try:
         async for msg in ws:
@@ -559,13 +663,18 @@ async def handle_browser(ws):
 
 
 async def main():
-    missing = [k for k, v in
-               [("DEEPGRAM_API_KEY", DG_KEY), ("CARTESIA_API_KEY", CART_KEY),
-                ("CARTESIA_VOICE_ID", VOICE_ID)] if not v]
+    profile = get_profile()
+    if profile == "zh":
+        required = [("DASHSCOPE_API_KEY", DS_KEY)]
+    else:
+        required = [("DEEPGRAM_API_KEY", DG_KEY),
+                    ("CARTESIA_API_KEY", CART_KEY),
+                    ("CARTESIA_VOICE_ID", VOICE_ID)]
+    missing = [k for k, v in required if not v]
     if missing:
-        print(f"missing env: {', '.join(missing)}")
+        print(f"missing env for profile={profile}: {', '.join(missing)}")
         raise SystemExit(1)
-    print(f"serving on http://0.0.0.0:{PORT}/  (ws: /ws)")
+    print(f"serving on http://0.0.0.0:{PORT}/  (ws: /ws)  profile={profile}")
     async with serve(handle_browser, "0.0.0.0", PORT,
                      process_request=process_request,
                      max_size=16 * 1024 * 1024):
