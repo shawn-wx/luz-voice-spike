@@ -232,14 +232,32 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
                 pass
 
 
-async def dashscope_speak(text, audio_out, cancel_event, context_id):
+async def dashscope_speak(text, audio_out, cancel_event, context_id,
+                        on_status=None):
     """Stream TTS audio chunks into audio_out queue.
+
+    DashScope-native TTS realtime flow (per provider docs):
+        session.update {voice, response_format, sample_rate, mode}
+        -> input_text_buffer.append {text}
+        -> input_text_buffer.commit
+        -> response.audio.delta (base64 pcm16 24kHz) ... -> response.done
 
     Same contract as cartesia_speak(): returns (ttfa_ms, word_timestamps).
     The realtime TTS API does not provide word timestamps, so the list is
     always empty (client falls back to volume-envelope lip sync).
     Does NOT put an end marker; the caller manages queue termination.
+    on_status(status, error): optional callback; server errors are
+    forwarded so the test page shows the real cause.
     """
+    async def report(status, error=None):
+        if on_status:
+            try:
+                await on_status(status, error)
+            except Exception:
+                pass
+        else:
+            print(f"[ds-tts] {status}: {error}")
+
     url = (f"{DASHSCOPE_WS_BASE}?"
            f"{urllib.parse.urlencode({'model': TTS_MODEL})}")
     t_send = None
@@ -249,7 +267,7 @@ async def dashscope_speak(text, audio_out, cancel_event, context_id):
             url, additional_headers=_headers(),
             max_size=16 * 1024 * 1024,
         ) as ws:
-            # wait for session.created, then set voice
+            # wait for session.created, then configure voice
             try:
                 async for raw in ws:
                     try:
@@ -259,21 +277,39 @@ async def dashscope_speak(text, audio_out, cancel_event, context_id):
                     if d.get("type") == "session.created":
                         break
                     if d.get("type") == "error":
-                        print(f"[ds-tts] session error: {d}")
+                        await report("error", f"session: {d}"[:300])
                         return None, []
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
+                await report("error", f"closed before session.created: "
+                                      f"{_close_info(e)}")
                 return None, []
             await ws.send(_event("session.update", session={
                 "voice": TTS_VOICE,
-                "output_audio_format": "pcm16",
+                "response_format": "pcm16",
+                "sample_rate": 24000,
+                "mode": "server_commit",
             }))
+            # wait for session.updated (surface rejection immediately)
+            try:
+                async for raw in ws:
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if d.get("type") == "session.updated":
+                        break
+                    if d.get("type") == "error":
+                        await report("error",
+                                     f"session.update rejected: {d}"[:300])
+                        return None, []
+            except websockets.exceptions.ConnectionClosed as e:
+                await report("error", f"closed after session.update: "
+                                      f"{_close_info(e)}")
+                return None, []
             # one response turn per sentence
-            await ws.send(_event("conversation.item.create", item={
-                "type": "message", "role": "user", "content": [{
-                    "type": "input_text", "text": text}]}))
             t_send = time.perf_counter()
-            await ws.send(_event("response.create", response={
-                "modalities": ["audio", "text"]}))
+            await ws.send(_event("input_text_buffer.append", text=text))
+            await ws.send(_event("input_text_buffer.commit"))
             async for raw in ws:
                 if cancel_event.is_set():
                     try:
@@ -296,8 +332,8 @@ async def dashscope_speak(text, audio_out, cancel_event, context_id):
                     if mtype == "response.done":
                         break
                 elif mtype == "error":
-                    print(f"[ds-tts] error: {d}")
+                    await report("error", f"tts: {d}"[:300])
                     break
     except Exception as e:
-        print(f"[ds-tts] error: {e}")
+        await report("error", str(e)[:200])
     return ttfa_ms, []
