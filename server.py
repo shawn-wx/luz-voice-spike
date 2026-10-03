@@ -164,30 +164,32 @@ with open(os.path.join(BASE_DIR, "web", "index.html"), "rb") as f:
 
 
 async def process_request(connection, request: Request):
-    if request.path == "/healthz":
+    # 注意：某些 websockets 版本的 request.path 会带查询串，先剥掉
+    req_path = request.path.split("?", 1)[0]
+    if req_path == "/healthz":
         return Response(200, "OK",
                         Headers([("Content-Type", "text/plain")]), b"ok")
-    if request.path == "/debug/llm":
+    if req_path == "/debug/llm":
         body = json.dumps(await debug_llm(), ensure_ascii=False).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
                         body)
-    if request.path == "/debug/deepseek":
+    if req_path == "/debug/deepseek":
         body = json.dumps(await debug_llm("deepseek"),
                           ensure_ascii=False).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
                         body)
-    if request.path == "/debug/dashscope":
+    if req_path == "/debug/dashscope":
         body = json.dumps(await debug_llm("dashscope"),
                           ensure_ascii=False).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
                         body)
-    if request.path == "/api/voice-config":
+    if req_path == "/api/voice-config":
         # 后台可配置的语音链路：app 启动时拉取，按 profile 建连 /ws?profile=。
         # 改 PIPELINE_PROFILE secret 并重启即切换，无需重新打包 app。
         body = json.dumps({
@@ -199,7 +201,7 @@ async def process_request(connection, request: Request):
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
                         body)
-    if request.path == "/api/latency":
+    if req_path == "/api/latency":
         # 最近语音轮次的延迟记录（排查"回复慢"用）。
         # ?n=20 取最近 20 条；?format=text 取纯文本单行摘要。
         qs = {}
@@ -229,7 +231,7 @@ async def process_request(connection, request: Request):
                               ensure_ascii=False).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         return Response(200, "OK", Headers([("Content-Type", ctype)]), body)
-    if request.path in ("/", "/index.html"):
+    if req_path in ("/", "/index.html"):
         return Response(200, "OK",
                         Headers([("Content-Type",
                                    "text/html; charset=utf-8")]),
