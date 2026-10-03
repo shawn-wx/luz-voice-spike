@@ -278,7 +278,7 @@ async def debug_llm(name: str = None, model: str = None) -> dict:
             "host": "dashscope-intl.aliyuncs.com",
             "url": ("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
                     "/chat/completions"),
-            "model": os.environ.get("DASHSCOPE_MODEL", "qwen3.8-flash"),
+            "model": os.environ.get("DASHSCOPE_MODEL", "qwen-plus"),
             "key_env": "DASHSCOPE_API_KEY",
             "probe": "你好，你好吗？",
         },
