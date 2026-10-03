@@ -150,6 +150,8 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
                 return
 
             async def sender():
+                n_appends = 0
+                append_bytes = 0
                 try:
                     while not stop_event.is_set():
                         try:
@@ -160,6 +162,10 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
                         if msg is None:
                             break
                         if msg == "FINALIZE":
+                            await on_ds_status(
+                                "debug",
+                                f"commit: {n_appends} appends, "
+                                f"{append_bytes} bytes buffered")
                             try:
                                 await ws.send(_event(
                                     "input_audio_buffer.commit"))
@@ -171,6 +177,8 @@ async def dashscope_listen(mic_to_ds, on_final, on_ds_status, stop_event):
                                 "input_audio_buffer.append",
                                 audio=base64.b64encode(
                                     msg).decode("ascii")))
+                            n_appends += 1
+                            append_bytes += len(msg)
                         except Exception:
                             break
                 finally:
