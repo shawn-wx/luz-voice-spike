@@ -57,8 +57,14 @@ PORT = int(os.environ.get("PORT", "8080"))
 CARTESIA_VERSION = "2026-03-01"
 # Overridable for local tests with mock providers (this dev VM has no
 # outbound WebSocket, so real provider WS cannot be exercised here).
+# Flux 用 v2 endpoint（turn-based），Nova-3 用 v1。
 DEEPGRAM_WS_BASE = os.environ.get("DEEPGRAM_WS_BASE",
                                   "wss://api.deepgram.com/v1/listen")
+DEEPGRAM_FLUX_WS_BASE = os.environ.get("DEEPGRAM_FLUX_WS_BASE",
+                                       "wss://api.deepgram.com/v2/listen")
+# 西语 ASR 模型：flux-general-multi（原生 turn detection）；
+# 可用环境变量切回 nova-3。
+DEEPGRAM_ES_MODEL = os.environ.get("DEEPGRAM_ES_MODEL", "flux-general-multi")
 CARTESIA_WS_BASE = os.environ.get("CARTESIA_WS_BASE",
                                   "wss://api.cartesia.ai/tts/websocket")
 
@@ -200,10 +206,16 @@ async def process_request(connection, request: Request):
     if req_path == "/api/voice-config":
         # 后台可配置的语音链路：app 启动时拉取，按 profile 建连 /ws?profile=。
         # 改 PIPELINE_PROFILE secret 并重启即切换，无需重新打包 app。
+        # native_turn_detection：ASR 是否有原生 turn 检测（Flux 有，DashScope/nova-3 无）；
+        # App 端 EOU 据此调整阈值（有原生则降级为兜底）。
+        _profile = get_profile()
+        _native_turn = (_profile == "es" and
+                        DEEPGRAM_ES_MODEL.startswith("flux"))
         body = json.dumps({
-            "profile": get_profile(),
+            "profile": _profile,
             "available": ["es", "zh"],
             "ws_path": "/ws",
+            "native_turn_detection": _native_turn,
         }).encode("utf-8")
         return Response(200, "OK",
                         Headers([("Content-Type",
@@ -477,6 +489,115 @@ async def deepgram_listen(mic_to_dg, on_final, on_dg_status, stop_event):
                 pass
 
 
+async def flux_listen(mic_to_dg, on_final, on_dg_status, stop_event):
+    """Deepgram Flux (v2/listen) turn-based STT for Spanish.
+
+    原生 turn detection：StartOfTurn/Update/EndOfTurn 事件。
+    EndOfTurn 即 EOU（模型级语义判断，<400ms），客户端 EOU 降级为兜底。
+    """
+    qs = urllib.parse.urlencode({
+        "model": DEEPGRAM_ES_MODEL,  # flux-general-multi
+        "language": "es",
+        # turn 检测阈值：0.5 更激进（快），1.0 完全关闭原生检测
+        "eot_threshold": "0.7",
+        "eot_timeout_ms": "3000",  # 3s 强制结束（兜底）
+        "encoding": "linear16",
+        "sample_rate": "16000",
+    })
+    url = f"{DEEPGRAM_FLUX_WS_BASE}?{qs}"
+
+    async def run_session():
+        async with websockets.connect(
+            url, additional_headers=deepgram_auth_headers(),
+            max_size=16 * 1024 * 1024,
+        ) as dg:
+            await on_dg_status("connected", f"flux:{DEEPGRAM_ES_MODEL}")
+
+            async def sender():
+                while not stop_event.is_set():
+                    try:
+                        msg = await asyncio.wait_for(mic_to_dg.get(),
+                                                     timeout=5.0)
+                    except asyncio.TimeoutError:
+                        # Flux 不需要 KeepAlive，但发一个无害
+                        continue
+                    if msg is None:
+                        break
+                    if msg == "FINALIZE":
+                        # Flux 原生 turn 检测为主；客户端 EOU 兜底时强制结束
+                        try:
+                            await dg.send(json.dumps({"type": "ForceEndTurn"}))
+                        except Exception:
+                            break
+                        continue
+                    try:
+                        await dg.send(msg)
+                    except Exception:
+                        break
+
+            async def receiver():
+                try:
+                    async for raw in dg:
+                        try:
+                            d = json.loads(raw)
+                        except ValueError:
+                            continue
+                        dtype = d.get("type")
+                        if dtype == "Connected":
+                            continue
+                        if dtype == "Error":
+                            print(f"[flux] error: {d.get('description')}")
+                            await on_dg_status("error", d.get("description"))
+                            continue
+                        if dtype != "TurnInfo":
+                            continue
+                        event = d.get("event")
+                        text = d.get("transcript", "")
+                        if event == "StartOfTurn":
+                            # 可用于服务端打断检测（暂只记录）
+                            print(f"[flux] StartOfTurn")
+                            continue
+                        if event == "Update":
+                            if text:
+                                await on_final(text, False)
+                            continue
+                        if event == "EndOfTurn":
+                            # 原生 EOU！置信度一并记录
+                            conf = d.get("end_of_turn_confidence")
+                            print(f"[flux] EndOfTurn conf={conf}: {text[:40]}")
+                            if text:
+                                await on_final(text, True)
+                            continue
+                        # Preflight/SpeechResumed 等忽略
+                except websockets.exceptions.ConnectionClosed:
+                    pass
+
+            sender_task = asyncio.create_task(sender())
+            try:
+                await receiver()
+            finally:
+                sender_task.cancel()
+                try:
+                    await sender_task
+                except asyncio.CancelledError:
+                    pass
+
+    while not stop_event.is_set():
+        try:
+            await run_session()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[flux] error: {e}")
+            await on_dg_status("error", str(e))
+        if not stop_event.is_set():
+            await on_dg_status("reconnecting", None)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+
 async def cartesia_speak(text, audio_out, cancel_event, context_id):
     """Stream TTS audio chunks into audio_out queue.
 
@@ -685,10 +806,14 @@ async def handle_browser(ws):
 
         print("[session] profile=zh (DashScope)")
     else:
-        asr_listen = deepgram_listen
+        # Flux 开原生 turn detection；切回 nova-3 用环境变量 DEEPGRAM_ES_MODEL=nova-3
+        if DEEPGRAM_ES_MODEL.startswith("flux"):
+            asr_listen = flux_listen
+        else:
+            asr_listen = deepgram_listen
         tts_speak = cartesia_speak
         from llm.persona import SYSTEM_PROMPT as persona
-        print("[session] profile=es (Deepgram/Cartesia)")
+        print(f"[session] profile=es (Deepgram {DEEPGRAM_ES_MODEL}/Cartesia)")
 
     async def on_final(text, is_final):
         await ws.send(json.dumps(
