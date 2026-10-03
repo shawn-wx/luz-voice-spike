@@ -543,8 +543,14 @@ async def handle_browser(ws):
     # Pipeline profile: es (Deepgram/Cartesia) or zh (DashScope).
     if get_profile() == "zh":
         from dashscope_rt import dashscope_listen as asr_listen
-        from dashscope_rt import dashscope_speak as tts_speak
+        from dashscope_rt import dashscope_speak as _tts_speak
         from llm.persona import SYSTEM_PROMPT_ZH as persona
+
+        async def tts_speak(text, audio_out, cancel_event, context_id):
+            # forward TTS server errors to the test page
+            return await _tts_speak(text, audio_out, cancel_event,
+                                    context_id, on_status=on_dg_status)
+
         print("[session] profile=zh (DashScope)")
     else:
         asr_listen = deepgram_listen
