@@ -34,6 +34,7 @@ Without the provider's API key, falls back to stub automatically.
 """
 import asyncio
 import base64
+import collections
 import json
 import os
 import sys
@@ -60,6 +61,25 @@ DEEPGRAM_WS_BASE = os.environ.get("DEEPGRAM_WS_BASE",
                                   "wss://api.deepgram.com/v1/listen")
 CARTESIA_WS_BASE = os.environ.get("CARTESIA_WS_BASE",
                                   "wss://api.cartesia.ai/tts/websocket")
+
+
+# 最近 N 次完整语音轮次的延迟记录（内存环形缓冲，供 /api/latency 查询）。
+# 2026-10-03 加：手机端 logcat 拿不到，服务端必须自己记，否则延迟问题无法复盘。
+LATENCY_LOG = collections.deque(maxlen=100)
+
+
+def record_latency(entry: dict):
+    entry = dict(entry)
+    entry["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    LATENCY_LOG.append(entry)
+    # Fly 日志里也能看到单行摘要
+    print("[latency] profile={profile} llm={llm_provider} "
+          "llm_ttft={llm_ttft_ms}ms llm_total={llm_total_ms}ms "
+          "tts_ttfa={tts_ttfa_ms}ms first_audio={first_audio_ms}ms "
+          "q={user_text!r}".format(**{k: entry.get(k) for k in
+              ("profile", "llm_provider", "llm_ttft_ms", "llm_total_ms",
+               "tts_ttfa_ms", "first_audio_ms", "user_text")}),
+          flush=True)
 
 
 def get_profile() -> str:
@@ -179,6 +199,36 @@ async def process_request(connection, request: Request):
                         Headers([("Content-Type",
                                    "application/json; charset=utf-8")]),
                         body)
+    if request.path == "/api/latency":
+        # 最近语音轮次的延迟记录（排查"回复慢"用）。
+        # ?n=20 取最近 20 条；?format=text 取纯文本单行摘要。
+        qs = {}
+        try:
+            target = getattr(request, "target", request.path)
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(target).query)
+        except Exception:
+            pass
+        try:
+            n = max(1, min(100, int(qs.get("n", ["20"])[0])))
+        except (ValueError, TypeError):
+            n = 20
+        items = list(LATENCY_LOG)[-n:]
+        if qs.get("format", ["json"])[0] == "text":
+            lines = ["ts | profile | llm_ttft | llm_total | tts_ttfa | "
+                     "first_audio | user_text"]
+            for e in items:
+                lines.append(
+                    f"{e.get('ts')} | {e.get('profile')} | "
+                    f"{e.get('llm_ttft_ms')}ms | {e.get('llm_total_ms')}ms | "
+                    f"{e.get('tts_ttfa_ms')}ms | {e.get('first_audio_ms')}ms | "
+                    f"{(e.get('user_text') or '')[:60]}")
+            body = "\n".join(lines).encode("utf-8")
+            ctype = "text/plain; charset=utf-8"
+        else:
+            body = json.dumps({"count": len(items), "items": items},
+                              ensure_ascii=False).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        return Response(200, "OK", Headers([("Content-Type", ctype)]), body)
     if request.path in ("/", "/index.html"):
         return Response(200, "OK",
                         Headers([("Content-Type",
@@ -665,7 +715,7 @@ async def handle_browser(ws):
                         {"type": "words", "words": result["words"]}))
                 except Exception:
                     pass
-            await ws.send(json.dumps({
+            latency_msg = {
                 "type": "latency",
                 "llm_provider": result.get("provider"),
                 "llm_ttft_ms": result.get("llm_ttft_ms"),
@@ -674,7 +724,20 @@ async def handle_browser(ws):
                 "first_audio_ms": round(first_audio_ms, 1)
                 if first_audio_ms else None,
                 "note": f"Phase 3: {result.get('provider')}",
-            }))
+            }
+            await ws.send(json.dumps(latency_msg))
+            # 服务端也记一份（/api/latency 可查），手机 logcat 拿不到
+            record_latency({
+                "profile": conn_profile(ws),
+                "llm_provider": result.get("provider"),
+                "llm_ttft_ms": result.get("llm_ttft_ms"),
+                "llm_total_ms": result.get("llm_total_ms"),
+                "tts_ttfa_ms": result.get("tts_ttfa_ms"),
+                "first_audio_ms": round(first_audio_ms, 1)
+                if first_audio_ms else None,
+                "user_text": text,
+                "reply_chars": len(result.get("reply") or ""),
+            })
             state["speaking"] = False
 
     async def on_dg_status(status, error):
