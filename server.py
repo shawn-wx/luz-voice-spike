@@ -857,11 +857,9 @@ async def handle_browser(ws):
             audio_out = asyncio.Queue()
             context_id = uuid.uuid4().hex
             await ws.send(json.dumps({"type": "tts_start"}))
-            _is_zh = conn_profile(ws) == "zh"
             speak_task = asyncio.create_task(
                 llm_speak(text, audio_out, tts_cancel, context_id, state,
-                          tts_fn=tts_speak, system_prompt=persona,
-                          single_shot_tts=_is_zh))
+                          tts_fn=tts_speak, system_prompt=persona))
 
             async def pump_audio():
                 first_sent_at = None
