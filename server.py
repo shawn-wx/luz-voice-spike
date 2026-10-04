@@ -811,6 +811,12 @@ async def handle_browser(ws):
     stop_event = asyncio.Event()
     tts_cancel = asyncio.Event()
     state = {"speaking": False, "final_at": None}
+    ws_send_lock = asyncio.Lock()
+
+    async def ws_send_safe(msg):
+        """串行化 WebSocket 发送，防并发冲突导致消息丢失/错乱"""
+        async with ws_send_lock:
+            await ws.send(msg)
 
     # Pipeline profile: ?profile=zh|es overrides the server default.
     profile = conn_profile(ws)
@@ -866,48 +872,44 @@ async def handle_browser(ws):
                 tts_cancel.clear()
                 audio_out = asyncio.Queue()
                 context_id = uuid.uuid4().hex
-                await ws.send(json.dumps({"type": "tts_start"}))
-                speak_task = asyncio.create_task(
-                    llm_speak(text, audio_out, tts_cancel, context_id, state,
-                              tts_fn=tts_speak, system_prompt=persona))
-
-                async def pump_audio():
-                    first_sent_at = None
-                    while True:
-                        chunk = await audio_out.get()
-                        if chunk is None:
-                            break
-                        if tts_cancel.is_set():
-                            break
-                        try:
-                            await ws.send(chunk)  # binary PCM16 24kHz
-                            if first_sent_at is None:
-                                first_sent_at = time.perf_counter()
-                        except Exception:
-                            break
-                    return first_sent_at
-
-                pump_task = asyncio.create_task(pump_audio())
-                result = await speak_task
-                # 先发回复文字（App 显示在对话框），再等音频播完发 tts_end
+                await ws_send_safe(json.dumps({"type": "tts_start"}))
+                # 顺序执行：LLM+TTS 生成完 -> 发文字 -> 发音频 -> 发 tts_end
+                # 无并发，从根本上消除 ws.send 竞态
+                result = await llm_speak(
+                    text, audio_out, tts_cancel, context_id, state,
+                    tts_fn=tts_speak, system_prompt=persona)
+                # 先发回复文字（App 显示在对话框）
                 if result.get("reply"):
                     try:
-                        await ws.send(json.dumps(
+                        await ws_send_safe(json.dumps(
                             {"type": "reply", "text": result["reply"]}))
                     except Exception:
                         pass
                 # 词级时间戳（口型同步用）
                 if result.get("words"):
                     try:
-                        await ws.send(json.dumps(
+                        await ws_send_safe(json.dumps(
                             {"type": "words", "words": result["words"]}))
                     except Exception:
                         pass
-                first_sent_at = await pump_task
-                # 音频播完，发 tts_end（App 收到后隐藏对话框）
-                # 保证顺序：reply -> words -> tts_end
+                # 顺序发送音频块
+                first_sent_at = None
+                while True:
+                    chunk = await audio_out.get()
+                    if chunk is None:
+                        break
+                    if tts_cancel.is_set():
+                        break
+                    try:
+                        await ws_send_safe(chunk)  # binary PCM16 24kHz
+                        if first_sent_at is None:
+                            first_sent_at = time.perf_counter()
+                    except Exception:
+                        break
+                # 音频发完，发 tts_end（App 收到后隐藏对话框）
+                # 保证顺序：reply -> words -> audio -> tts_end
                 try:
-                    await ws.send(json.dumps({"type": "tts_end"}))
+                    await ws_send_safe(json.dumps({"type": "tts_end"}))
                 except Exception:
                     pass
                 # first_audio_ms: final transcript -> first audio byte to browser
