@@ -834,24 +834,17 @@ async def handle_browser(ws):
 
     if profile == "zh":
         from dashscope_rt import dashscope_listen as asr_listen
-        from dashscope_rt import dashscope_speak as _tts_speak
         from dashscope_rt import dashscope_tts_http as _tts_http
         from llm.persona import SYSTEM_PROMPT_ZH as persona
 
         async def tts_speak(text, audio_out, cancel_event, context_id):
-            # WebSocket 版优先（流式低延迟），失败则 HTTP 版兜底
-            ttfa, words = await _tts_speak(
+            # 中文直接用 HTTP TTS（可靠，无 WebSocket 限流/断流问题）
+            # 配合 single_shot_tts 整句模式，保证文字音频同步
+            return await _tts_http(
                 text, audio_out, cancel_event, context_id,
                 on_status=on_dg_status)
-            # 检查是否有音频实际产出：ttfa 为 None 说明 WebSocket 版完全失败
-            if ttfa is None:
-                print(f"[tts] ws 失败，切 HTTP 兜底: {text[:30]}...")
-                ttfa, words = await _tts_http(
-                    text, audio_out, cancel_event, context_id,
-                    on_status=on_dg_status)
-            return ttfa, words
 
-        print("[session] profile=zh (DashScope)")
+        print("[session] profile=zh (DashScope HTTP TTS)")
     else:
         # Flux 开原生 turn detection；切回 nova-3 用环境变量 DEEPGRAM_ES_MODEL=nova-3
         if DEEPGRAM_ES_MODEL.startswith("flux"):
@@ -873,9 +866,12 @@ async def handle_browser(ws):
                 audio_out = asyncio.Queue()
                 context_id = uuid.uuid4().hex
                 await ws_send_safe(json.dumps({"type": "tts_start"}))
+                # 中文用整句模式：LLM 生成完 -> HTTP TTS 整句 -> 先发文字后发音频
+                _is_zh = (profile == "zh")
                 speak_task = asyncio.create_task(
                     llm_speak(text, audio_out, tts_cancel, context_id, state,
-                              tts_fn=tts_speak, system_prompt=persona))
+                              tts_fn=tts_speak, system_prompt=persona,
+                              single_shot_tts=_is_zh))
 
                 async def pump_audio():
                     first_sent_at = None
