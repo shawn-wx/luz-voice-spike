@@ -834,17 +834,23 @@ async def handle_browser(ws):
 
     if profile == "zh":
         from dashscope_rt import dashscope_listen as asr_listen
+        from dashscope_rt import dashscope_speak as _tts_speak
         from dashscope_rt import dashscope_tts_http as _tts_http
         from llm.persona import SYSTEM_PROMPT_ZH as persona
 
         async def tts_speak(text, audio_out, cancel_event, context_id):
-            # 中文直接用 HTTP TTS（可靠，无 WebSocket 限流/断流问题）
-            # 配合 single_shot_tts 整句模式，保证文字音频同步
-            return await _tts_http(
+            # WebSocket 优先（流式），失败则 HTTP 兜底
+            ttfa, words = await _tts_speak(
                 text, audio_out, cancel_event, context_id,
                 on_status=on_dg_status)
+            if ttfa is None:
+                print(f"[tts] ws 失败，切 HTTP 兜底: {text[:30]}...")
+                ttfa, words = await _tts_http(
+                    text, audio_out, cancel_event, context_id,
+                    on_status=on_dg_status)
+            return ttfa, words
 
-        print("[session] profile=zh (DashScope HTTP TTS)")
+        print("[session] profile=zh (DashScope WS+HTTP)")
     else:
         # Flux 开原生 turn detection；切回 nova-3 用环境变量 DEEPGRAM_ES_MODEL=nova-3
         if DEEPGRAM_ES_MODEL.startswith("flux"):
