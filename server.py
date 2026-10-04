@@ -237,12 +237,15 @@ async def process_request(connection, request: Request):
         items = list(LATENCY_LOG)[-n:]
         if qs.get("format", ["json"])[0] == "text":
             lines = ["ts | profile | llm_ttft | llm_total | tts_ttfa | "
-                     "first_audio | user_text"]
+                     "first_audio | asr_lat | user_text"]
             for e in items:
+                _asr = e.get('asr_latency_ms')
+                _asr_s = f"{_asr}ms" if _asr is not None else "-"
                 lines.append(
                     f"{e.get('ts')} | {e.get('profile')} | "
                     f"{e.get('llm_ttft_ms')}ms | {e.get('llm_total_ms')}ms | "
                     f"{e.get('tts_ttfa_ms')}ms | {e.get('first_audio_ms')}ms | "
+                    f"{_asr_s} | "
                     f"{(e.get('user_text') or '')[:60]}")
             body = "\n".join(lines).encode("utf-8")
             ctype = "text/plain; charset=utf-8"
@@ -878,6 +881,11 @@ async def handle_browser(ws):
             }
             await ws.send(json.dumps(latency_msg))
             # 服务端也记一份（/api/latency 可查），手机 logcat 拿不到
+            # asr_latency: EOU(utterance_end) 到 ASR final 的耗时，区分"ASR 慢" vs "EOU 等待"
+            _utterance_end = state.get("utterance_end_at")
+            _final_at = state.get("final_at")
+            _asr_latency = round((_final_at - _utterance_end) * 1000, 1) \
+                if _utterance_end and _final_at and _final_at >= _utterance_end else None
             record_latency({
                 "profile": conn_profile(ws),
                 "llm_provider": result.get("provider"),
@@ -886,6 +894,7 @@ async def handle_browser(ws):
                 "tts_ttfa_ms": result.get("tts_ttfa_ms"),
                 "first_audio_ms": round(first_audio_ms, 1)
                 if first_audio_ms else None,
+                "asr_latency_ms": _asr_latency,
                 "user_text": text,
                 "reply_chars": len(result.get("reply") or ""),
             })
@@ -926,6 +935,8 @@ async def handle_browser(ws):
                     state["speaking"] = False
                 elif d.get("type") == "utterance_end":
                     # user released the button: force Deepgram to finalize
+                    # 记录 EOU 时间，用于区分"ASR 慢" vs "EOU 等待久"
+                    state["utterance_end_at"] = time.perf_counter()
                     await mic_queue.put("FINALIZE")
                 elif d.get("type") == "stop":
                     break
