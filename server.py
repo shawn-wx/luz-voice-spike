@@ -705,17 +705,27 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
     async def speak_sentence(sentence):
         nonlocal tts_ttfa_ms
         # TTS 单句超时 15 秒，防止 WebSocket 挂起导致"长时间不播报"
-        try:
-            ttfa, words = await asyncio.wait_for(
-                tts_fn(sentence, audio_out, cancel_event, context_id),
-                timeout=15.0,
-            )
-        except asyncio.TimeoutError:
-            print(f"[llm] TTS 超时，跳过: {sentence[:30]}...")
-            return []
-        if tts_ttfa_ms is None and ttfa:
-            tts_ttfa_ms = ttfa
-        return words
+        # 失败重试 1 次（应对限流）
+        last_err = None
+        for attempt in range(2):
+            try:
+                ttfa, words = await asyncio.wait_for(
+                    tts_fn(sentence, audio_out, cancel_event, context_id),
+                    timeout=15.0,
+                )
+                if tts_ttfa_ms is None and ttfa:
+                    tts_ttfa_ms = ttfa
+                return words
+            except asyncio.TimeoutError:
+                last_err = "timeout"
+                print(f"[llm] TTS 超时 (尝试 {attempt+1}/2): {sentence[:30]}...")
+            except Exception as e:
+                last_err = str(e)[:100]
+                print(f"[llm] TTS 失败 (尝试 {attempt+1}/2): {sentence[:30]}... err={last_err}")
+            if attempt == 0:
+                await asyncio.sleep(1.0)  # 限流时等 1 秒再试
+        print(f"[llm] TTS 放弃: {sentence[:30]}...")
+        return []
 
     sentence_buf = ""
     all_words = []  # [{"word","start_ms","end_ms"}] 相对整段回复音频
