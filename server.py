@@ -873,11 +873,28 @@ async def handle_browser(ws):
                 audio_out = asyncio.Queue()
                 context_id = uuid.uuid4().hex
                 await ws_send_safe(json.dumps({"type": "tts_start"}))
-                # 顺序执行：LLM+TTS 生成完 -> 发文字 -> 发音频 -> 发 tts_end
-                # 无并发，从根本上消除 ws.send 竞态
-                result = await llm_speak(
-                    text, audio_out, tts_cancel, context_id, state,
-                    tts_fn=tts_speak, system_prompt=persona)
+                speak_task = asyncio.create_task(
+                    llm_speak(text, audio_out, tts_cancel, context_id, state,
+                              tts_fn=tts_speak, system_prompt=persona))
+
+                async def pump_audio():
+                    first_sent_at = None
+                    while True:
+                        chunk = await audio_out.get()
+                        if chunk is None:
+                            break
+                        if tts_cancel.is_set():
+                            break
+                        try:
+                            await ws_send_safe(chunk)  # binary PCM16 24kHz
+                            if first_sent_at is None:
+                                first_sent_at = time.perf_counter()
+                        except Exception:
+                            break
+                    return first_sent_at
+
+                pump_task = asyncio.create_task(pump_audio())
+                result = await speak_task
                 # 先发回复文字（App 显示在对话框）
                 if result.get("reply"):
                     try:
@@ -892,22 +909,8 @@ async def handle_browser(ws):
                             {"type": "words", "words": result["words"]}))
                     except Exception:
                         pass
-                # 顺序发送音频块
-                first_sent_at = None
-                while True:
-                    chunk = await audio_out.get()
-                    if chunk is None:
-                        break
-                    if tts_cancel.is_set():
-                        break
-                    try:
-                        await ws_send_safe(chunk)  # binary PCM16 24kHz
-                        if first_sent_at is None:
-                            first_sent_at = time.perf_counter()
-                    except Exception:
-                        break
+                first_sent_at = await pump_task
                 # 音频发完，发 tts_end（App 收到后隐藏对话框）
-                # 保证顺序：reply -> words -> audio -> tts_end
                 try:
                     await ws_send_safe(json.dumps({"type": "tts_end"}))
                 except Exception:
