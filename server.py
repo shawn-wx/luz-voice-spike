@@ -742,7 +742,6 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                     llm_ttft_ms = (time.perf_counter() - llm_start) * 1000.0
                 full_reply += delta
                 if single_shot_tts:
-                    # 整句模式：只累积，不切分
                     continue
                 sentence_buf += delta
                 while True:
@@ -766,7 +765,6 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                         if words:
                             audio_offset_ms = max(w["end_ms"] for w in words)
         if single_shot_tts:
-            # 整句一次 TTS
             if full_reply.strip() and not cancel_event.is_set():
                 words = await speak_sentence(full_reply.strip())
                 all_words.extend(words)
@@ -859,7 +857,6 @@ async def handle_browser(ws):
             audio_out = asyncio.Queue()
             context_id = uuid.uuid4().hex
             await ws.send(json.dumps({"type": "tts_start"}))
-            # 中文 DashScope TTS 用整句模式（减少 WebSocket 建连，防限流）
             _is_zh = conn_profile(ws) == "zh"
             speak_task = asyncio.create_task(
                 llm_speak(text, audio_out, tts_cancel, context_id, state,
