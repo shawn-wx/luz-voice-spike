@@ -17,7 +17,7 @@ from .base import LLMProvider
 API_URL = os.environ.get(
     "DASHSCOPE_API_URL",
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions")
-MODEL = os.environ.get("DASHSCOPE_MODEL", "qwen-plus")
+MODEL = os.environ.get("DASHSCOPE_MODEL", "qwen-turbo")
 
 
 class DashScopeProvider(LLMProvider):
