@@ -861,83 +861,85 @@ async def handle_browser(ws):
             {"type": "transcript", "text": text, "is_final": is_final}))
         if is_final and not state["speaking"]:
             state["speaking"] = True
-            state["final_at"] = time.perf_counter()
-            tts_cancel.clear()
-            audio_out = asyncio.Queue()
-            context_id = uuid.uuid4().hex
-            await ws.send(json.dumps({"type": "tts_start"}))
-            speak_task = asyncio.create_task(
-                llm_speak(text, audio_out, tts_cancel, context_id, state,
-                          tts_fn=tts_speak, system_prompt=persona))
+            try:
+                state["final_at"] = time.perf_counter()
+                tts_cancel.clear()
+                audio_out = asyncio.Queue()
+                context_id = uuid.uuid4().hex
+                await ws.send(json.dumps({"type": "tts_start"}))
+                speak_task = asyncio.create_task(
+                    llm_speak(text, audio_out, tts_cancel, context_id, state,
+                              tts_fn=tts_speak, system_prompt=persona))
 
-            async def pump_audio():
-                first_sent_at = None
-                while True:
-                    chunk = await audio_out.get()
-                    if chunk is None:
-                        break
-                    if tts_cancel.is_set():
-                        break
+                async def pump_audio():
+                    first_sent_at = None
+                    while True:
+                        chunk = await audio_out.get()
+                        if chunk is None:
+                            break
+                        if tts_cancel.is_set():
+                            break
+                        try:
+                            await ws.send(chunk)  # binary PCM16 24kHz
+                            if first_sent_at is None:
+                                first_sent_at = time.perf_counter()
+                        except Exception:
+                            break
+                    await ws.send(json.dumps({"type": "tts_end"}))
+                    return first_sent_at
+
+                pump_task = asyncio.create_task(pump_audio())
+                result = await speak_task
+                # 先发回复文字（App 显示在对话框），再等音频播完发 tts_end
+                if result.get("reply"):
                     try:
-                        await ws.send(chunk)  # binary PCM16 24kHz
-                        if first_sent_at is None:
-                            first_sent_at = time.perf_counter()
+                        await ws.send(json.dumps(
+                            {"type": "reply", "text": result["reply"]}))
                     except Exception:
-                        break
-                await ws.send(json.dumps({"type": "tts_end"}))
-                return first_sent_at
-
-            pump_task = asyncio.create_task(pump_audio())
-            result = await speak_task
-            # 先发回复文字（App 显示在对话框），再等音频播完发 tts_end
-            if result.get("reply"):
-                try:
-                    await ws.send(json.dumps(
-                        {"type": "reply", "text": result["reply"]}))
-                except Exception:
-                    pass
-            # 词级时间戳（口型同步用）
-            if result.get("words"):
-                try:
-                    await ws.send(json.dumps(
-                        {"type": "words", "words": result["words"]}))
-                except Exception:
-                    pass
-            first_sent_at = await pump_task
-            # first_audio_ms: final transcript -> first audio byte to browser
-            first_audio_ms = (
-                (first_sent_at - state["final_at"]) * 1000.0
-                if first_sent_at and state["final_at"] else None)
-            latency_msg = {
-                "type": "latency",
-                "llm_provider": result.get("provider"),
-                "llm_ttft_ms": result.get("llm_ttft_ms"),
-                "llm_total_ms": result.get("llm_total_ms"),
-                "tts_ttfa_ms": result.get("tts_ttfa_ms"),
-                "first_audio_ms": round(first_audio_ms, 1)
-                if first_audio_ms else None,
-                "note": f"Phase 3: {result.get('provider')}",
-            }
-            await ws.send(json.dumps(latency_msg))
-            # 服务端也记一份（/api/latency 可查），手机 logcat 拿不到
-            # asr_latency: EOU(utterance_end) 到 ASR final 的耗时，区分"ASR 慢" vs "EOU 等待"
-            _utterance_end = state.get("utterance_end_at")
-            _final_at = state.get("final_at")
-            _asr_latency = round((_final_at - _utterance_end) * 1000, 1) \
-                if _utterance_end and _final_at and _final_at >= _utterance_end else None
-            record_latency({
-                "profile": conn_profile(ws),
-                "llm_provider": result.get("provider"),
-                "llm_ttft_ms": result.get("llm_ttft_ms"),
-                "llm_total_ms": result.get("llm_total_ms"),
-                "tts_ttfa_ms": result.get("tts_ttfa_ms"),
-                "first_audio_ms": round(first_audio_ms, 1)
-                if first_audio_ms else None,
-                "asr_latency_ms": _asr_latency,
-                "user_text": text,
-                "reply_chars": len(result.get("reply") or ""),
-            })
-            state["speaking"] = False
+                        pass
+                # 词级时间戳（口型同步用）
+                if result.get("words"):
+                    try:
+                        await ws.send(json.dumps(
+                            {"type": "words", "words": result["words"]}))
+                    except Exception:
+                        pass
+                first_sent_at = await pump_task
+                # first_audio_ms: final transcript -> first audio byte to browser
+                first_audio_ms = (
+                    (first_sent_at - state["final_at"]) * 1000.0
+                    if first_sent_at and state["final_at"] else None)
+                latency_msg = {
+                    "type": "latency",
+                    "llm_provider": result.get("provider"),
+                    "llm_ttft_ms": result.get("llm_ttft_ms"),
+                    "llm_total_ms": result.get("llm_total_ms"),
+                    "tts_ttfa_ms": result.get("tts_ttfa_ms"),
+                    "first_audio_ms": round(first_audio_ms, 1)
+                    if first_audio_ms else None,
+                    "note": f"Phase 3: {result.get('provider')}",
+                }
+                await ws.send(json.dumps(latency_msg))
+                # 服务端也记一份（/api/latency 可查），手机 logcat 拿不到
+                # asr_latency: EOU(utterance_end) 到 ASR final 的耗时，区分"ASR 慢" vs "EOU 等待"
+                _utterance_end = state.get("utterance_end_at")
+                _final_at = state.get("final_at")
+                _asr_latency = round((_final_at - _utterance_end) * 1000, 1) \
+                    if _utterance_end and _final_at and _final_at >= _utterance_end else None
+                record_latency({
+                    "profile": conn_profile(ws),
+                    "llm_provider": result.get("provider"),
+                    "llm_ttft_ms": result.get("llm_ttft_ms"),
+                    "llm_total_ms": result.get("llm_total_ms"),
+                    "tts_ttfa_ms": result.get("tts_ttfa_ms"),
+                    "first_audio_ms": round(first_audio_ms, 1)
+                    if first_audio_ms else None,
+                    "asr_latency_ms": _asr_latency,
+                    "user_text": text,
+                    "reply_chars": len(result.get("reply") or ""),
+                })
+            finally:
+                state["speaking"] = False
 
     async def on_dg_status(status, error):
         try:
