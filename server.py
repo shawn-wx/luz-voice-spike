@@ -880,24 +880,25 @@ async def handle_browser(ws):
 
             pump_task = asyncio.create_task(pump_audio())
             result = await speak_task
-            first_sent_at = await pump_task
-            # first_audio_ms: final transcript -> first audio byte to browser
-            first_audio_ms = (
-                (first_sent_at - state["final_at"]) * 1000.0
-                if first_sent_at and state["final_at"] else None)
+            # 先发回复文字（App 显示在对话框），再等音频播完发 tts_end
             if result.get("reply"):
                 try:
                     await ws.send(json.dumps(
                         {"type": "reply", "text": result["reply"]}))
                 except Exception:
                     pass
-            # 词级时间戳（口型同步用）：tts_start 后下发
+            # 词级时间戳（口型同步用）
             if result.get("words"):
                 try:
                     await ws.send(json.dumps(
                         {"type": "words", "words": result["words"]}))
                 except Exception:
                     pass
+            first_sent_at = await pump_task
+            # first_audio_ms: final transcript -> first audio byte to browser
+            first_audio_ms = (
+                (first_sent_at - state["final_at"]) * 1000.0
+                if first_sent_at and state["final_at"] else None)
             latency_msg = {
                 "type": "latency",
                 "llm_provider": result.get("provider"),
