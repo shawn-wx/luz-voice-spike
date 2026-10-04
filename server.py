@@ -829,12 +829,21 @@ async def handle_browser(ws):
     if profile == "zh":
         from dashscope_rt import dashscope_listen as asr_listen
         from dashscope_rt import dashscope_speak as _tts_speak
+        from dashscope_rt import dashscope_tts_http as _tts_http
         from llm.persona import SYSTEM_PROMPT_ZH as persona
 
         async def tts_speak(text, audio_out, cancel_event, context_id):
-            # forward TTS server errors to the test page
-            return await _tts_speak(text, audio_out, cancel_event,
-                                    context_id, on_status=on_dg_status)
+            # WebSocket 版优先（流式低延迟），失败则 HTTP 版兜底
+            ttfa, words = await _tts_speak(
+                text, audio_out, cancel_event, context_id,
+                on_status=on_dg_status)
+            # 检查是否有音频实际产出：ttfa 为 None 说明 WebSocket 版完全失败
+            if ttfa is None:
+                print(f"[tts] ws 失败，切 HTTP 兜底: {text[:30]}...")
+                ttfa, words = await _tts_http(
+                    text, audio_out, cancel_event, context_id,
+                    on_status=on_dg_status)
+            return ttfa, words
 
         print("[session] profile=zh (DashScope)")
     else:
