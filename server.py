@@ -704,8 +704,15 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
 
     async def speak_sentence(sentence):
         nonlocal tts_ttfa_ms
-        ttfa, words = await tts_fn(sentence, audio_out,
-                                   cancel_event, context_id)
+        # TTS 单句超时 15 秒，防止 WebSocket 挂起导致"长时间不播报"
+        try:
+            ttfa, words = await asyncio.wait_for(
+                tts_fn(sentence, audio_out, cancel_event, context_id),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            print(f"[llm] TTS 超时，跳过: {sentence[:30]}...")
+            return []
         if tts_ttfa_ms is None and ttfa:
             tts_ttfa_ms = ttfa
         return words
