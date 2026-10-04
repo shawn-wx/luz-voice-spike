@@ -885,7 +885,6 @@ async def handle_browser(ws):
                                 first_sent_at = time.perf_counter()
                         except Exception:
                             break
-                    await ws.send(json.dumps({"type": "tts_end"}))
                     return first_sent_at
 
                 pump_task = asyncio.create_task(pump_audio())
@@ -905,6 +904,12 @@ async def handle_browser(ws):
                     except Exception:
                         pass
                 first_sent_at = await pump_task
+                # 音频播完，发 tts_end（App 收到后隐藏对话框）
+                # 保证顺序：reply -> words -> tts_end
+                try:
+                    await ws.send(json.dumps({"type": "tts_end"}))
+                except Exception:
+                    pass
                 # first_audio_ms: final transcript -> first audio byte to browser
                 first_audio_ms = (
                     (first_sent_at - state["final_at"]) * 1000.0
