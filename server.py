@@ -717,6 +717,8 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                 )
                 if tts_ttfa_ms is None and ttfa:
                     tts_ttfa_ms = ttfa
+                # 句子间小延迟，避免高频建连触发限流导致后续句子中断
+                await asyncio.sleep(0.3)
                 return words
             except asyncio.TimeoutError:
                 last_err = "timeout"
