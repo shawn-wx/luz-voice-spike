@@ -674,10 +674,12 @@ async def cartesia_speak(text, audio_out, cancel_event, context_id):
 # ------------------------------------------------------- LLM -> speech
 
 async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
-                  tts_fn=None, system_prompt=None, llm_provider=None):
+                  tts_fn=None, system_prompt=None, llm_provider=None,
+                  single_shot_tts=False):
     """Stream LLM reply sentence-by-sentence into TTS.
 
     tts_fn: async (text, audio_out, cancel_event, context_id)
+    single_shot_tts: True 则整句一次 TTS（中文 DashScope 用，减少建连防限流）
             -> (ttfa_ms, word_timestamps). Defaults to cartesia_speak.
     system_prompt / llm_provider: default to the es-profile Spanish
             persona and the profile's LLM provider.
@@ -739,6 +741,9 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                 if llm_ttft_ms is None:
                     llm_ttft_ms = (time.perf_counter() - llm_start) * 1000.0
                 full_reply += delta
+                if single_shot_tts:
+                    # 整句模式：只累积，不切分
+                    continue
                 sentence_buf += delta
                 while True:
                     # 中英文句末标点都切（中文后常无空格，故 \s*）
@@ -760,7 +765,12 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                         all_words.extend(words)
                         if words:
                             audio_offset_ms = max(w["end_ms"] for w in words)
-        if sentence_buf.strip() and not cancel_event.is_set():
+        if single_shot_tts:
+            # 整句一次 TTS
+            if full_reply.strip() and not cancel_event.is_set():
+                words = await speak_sentence(full_reply.strip())
+                all_words.extend(words)
+        elif sentence_buf.strip() and not cancel_event.is_set():
             words = await speak_sentence(sentence_buf.strip())
             for w in words:
                 w["start_ms"] += audio_offset_ms
@@ -849,9 +859,12 @@ async def handle_browser(ws):
             audio_out = asyncio.Queue()
             context_id = uuid.uuid4().hex
             await ws.send(json.dumps({"type": "tts_start"}))
+            # 中文 DashScope TTS 用整句模式（减少 WebSocket 建连，防限流）
+            _is_zh = conn_profile(ws) == "zh"
             speak_task = asyncio.create_task(
                 llm_speak(text, audio_out, tts_cancel, context_id, state,
-                          tts_fn=tts_speak, system_prompt=persona))
+                          tts_fn=tts_speak, system_prompt=persona,
+                          single_shot_tts=_is_zh))
 
             async def pump_audio():
                 first_sent_at = None
