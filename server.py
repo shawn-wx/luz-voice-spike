@@ -732,7 +732,11 @@ async def llm_speak(user_text, audio_out, cancel_event, context_id, state,
                     sent = sentence_buf[:m.end()].strip()
                     sentence_buf = sentence_buf[m.end():]
                     if sent and not cancel_event.is_set():
-                        words = await speak_sentence(sent)
+                        try:
+                            words = await speak_sentence(sent)
+                        except Exception as e:
+                            print(f"[llm] TTS 句子失败，跳过: {sent[:30]}... err={e}")
+                            continue
                         for w in words:
                             w["start_ms"] += audio_offset_ms
                             w["end_ms"] += audio_offset_ms
