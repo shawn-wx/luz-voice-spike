@@ -866,12 +866,12 @@ async def handle_browser(ws):
                 audio_out = asyncio.Queue()
                 context_id = uuid.uuid4().hex
                 await ws_send_safe(json.dumps({"type": "tts_start"}))
-                # 中文用整句模式：LLM 生成完 -> HTTP TTS 整句 -> 先发文字后发音频
-                _is_zh = (profile == "zh")
+                # 流式：LLM 逐句 -> TTS 逐句(HTTP) -> 音频流式发送
+                # 用 ws_send_safe 保证发送串行，无竞态
                 speak_task = asyncio.create_task(
                     llm_speak(text, audio_out, tts_cancel, context_id, state,
                               tts_fn=tts_speak, system_prompt=persona,
-                              single_shot_tts=_is_zh))
+                              single_shot_tts=False))
 
                 async def pump_audio():
                     first_sent_at = None
@@ -908,9 +908,30 @@ async def handle_browser(ws):
                 first_sent_at = await pump_task
                 # 音频发完，发 tts_end（App 收到后隐藏对话框）
                 try:
-                    await ws_send_safe(json.dumps({"type": "tts_end"}))
+                    # tts_complete：音频播完，但对话框不关闭（用户点结束或60s超时才关）
+                    await ws_send_safe(json.dumps({"type": "tts_complete"}))
                 except Exception:
                     pass
+                # 对话框保持打开，启动60s超时计时
+                state["dialog_open"] = True
+                state["last_activity"] = time.perf_counter()
+                # 取消旧的超时任务（如果有）
+                _old_timer = state.pop("timeout_task", None)
+                if _old_timer and not _old_timer.done():
+                    _old_timer.cancel()
+                async def _dialog_timeout():
+                    try:
+                        await asyncio.sleep(60)
+                        # 60s 无操作，关闭对话框
+                        if state.get("dialog_open"):
+                            state["dialog_open"] = False
+                            try:
+                                await ws_send_safe(json.dumps({"type": "dialog_timeout"}))
+                            except Exception:
+                                pass
+                    except asyncio.CancelledError:
+                        pass
+                state["timeout_task"] = asyncio.create_task(_dialog_timeout())
                 # first_audio_ms: final transcript -> first audio byte to browser
                 first_audio_ms = (
                     (first_sent_at - state["final_at"]) * 1000.0
@@ -980,6 +1001,15 @@ async def handle_browser(ws):
                     print("[session] barge-in: cancelling TTS")
                     tts_cancel.set()
                     state["speaking"] = False
+                elif d.get("type") == "end_dialog":
+                    # 用户主动结束对话：关闭对话框，取消超时计时
+                    print("[session] user ended dialog")
+                    state["dialog_open"] = False
+                    _t = state.pop("timeout_task", None)
+                    if _t and not _t.done():
+                        _t.cancel()
+                    # 更新活动时间，防止超时任务误触发
+                    state["last_activity"] = time.perf_counter()
                 elif d.get("type") == "utterance_end":
                     # user released the button: force Deepgram to finalize
                     # 记录 EOU 时间，用于区分"ASR 慢" vs "EOU 等待久"
